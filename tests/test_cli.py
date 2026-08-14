@@ -52,3 +52,26 @@ def test_tool_arguments_pass_through_to_entry_command(tmp_path, monkeypatch):
     assert dispatch_tool("demo", ["render", "two words", "--fast"]) == 0
     assert calls[0][0] == "bin/demo render 'two words' --fast"
     assert calls[0][1]["cwd"] == tmp_path
+
+
+def test_uninstall_command_keeps_files_when_requested(tmp_path, monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        "ownbox.cli.uninstall",
+        lambda name, keep_files=False: calls.append((name, keep_files)) or tmp_path,
+    )
+
+    assert main(["uninstall", "demo", "--keep-files"]) == 0
+    assert calls == [("demo", True)]
+    assert f"kept checkout at {tmp_path}" in capsys.readouterr().out
+
+
+def test_installed_tool_can_uninstall_itself(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(
+        "ownbox.cli.installations",
+        lambda: {"demo": {"path": str(tmp_path), "repo": "me/demo"}},
+    )
+    monkeypatch.setattr("ownbox.cli.uninstall", lambda name: tmp_path)
+
+    assert dispatch_tool("demo", ["uninstall"]) == 0
+    assert "Uninstalled demo" in capsys.readouterr().out

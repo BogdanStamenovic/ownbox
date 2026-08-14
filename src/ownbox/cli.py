@@ -19,6 +19,7 @@ from .store import (
     install,
     installations,
     new_catalog,
+    uninstall,
     update,
 )
 
@@ -28,6 +29,8 @@ TOP_LEVEL_COMMANDS = {
     "info",
     "install",
     "add",
+    "uninstall",
+    "remove",
     "list",
     "ls",
     "update",
@@ -109,8 +112,18 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--path", type=Path, help="custom clone destination")
     add.add_argument("-y", "--yes", action="store_true", help="approve manifest setup commands")
 
+    remove = sub.add_parser(
+        "uninstall", aliases=["remove"], help="unregister a tool and remove its checkout"
+    )
+    remove.add_argument("name")
+    remove.add_argument(
+        "--keep-files", action="store_true", help="keep the checkout while removing the launcher"
+    )
+
     sub.add_parser("list", aliases=["ls"], help="list installed tools")
-    upgrade = sub.add_parser("update", aliases=["upgrade"], help="pull and set up an installed tool")
+    upgrade = sub.add_parser(
+        "update", aliases=["upgrade"], help="pull and set up an installed tool"
+    )
     upgrade.add_argument("name")
 
     run = sub.add_parser("run", help="run a named command from an installed tool")
@@ -128,7 +141,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="entry command that receives all non-Ownbox arguments",
     )
     init.add_argument(
-        "--setup", action="append", default=[], metavar="COMMAND", help="setup command; repeat as needed"
+        "--setup",
+        action="append",
+        default=[],
+        metavar="COMMAND",
+        help="setup command; repeat as needed",
     )
 
     sub.add_parser("doctor", help="check local dependencies and GitHub login")
@@ -169,6 +186,12 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Command: {bin_home() / tool.name}")
             if str(bin_home()) not in os.environ.get("PATH", "").split(os.pathsep):
                 print(f"Add {bin_home()} to PATH to invoke '{tool.name}' directly.")
+        elif args.command in {"uninstall", "remove"}:
+            target = uninstall(args.name, keep_files=args.keep_files)
+            if args.keep_files:
+                print(f"Uninstalled {args.name}; kept checkout at {target}")
+            else:
+                print(f"Uninstalled {args.name}; removed checkout at {target}")
         elif args.command in {"list", "ls"}:
             state = installations()
             if not state:
@@ -211,7 +234,13 @@ def main(argv: list[str] | None = None) -> int:
                 print(f"GitHub login: unavailable ({exc})")
                 return 1
         return 0
-    except (GitHubError, ManifestError, RuntimeError, KeyError, subprocess.CalledProcessError) as exc:
+    except (
+        GitHubError,
+        ManifestError,
+        RuntimeError,
+        KeyError,
+        subprocess.CalledProcessError,
+    ) as exc:
         if isinstance(exc, KeyError):
             message = f"tool not found: {exc.args[0]}; run 'ownbox search --refresh'"
         else:
@@ -238,15 +267,19 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
     try:
         installed_name, item = installed_tool(name)
         target = Path(item["path"])
-        manifest = Manifest.from_path(target / "ownbox.yaml", item["repo"])
         action = arguments[0] if arguments else None
         if action == "update":
             updated = update(installed_name)
             print(f"Updated {installed_name} at {updated}")
             return 0
+        if action == "uninstall":
+            removed = uninstall(installed_name)
+            print(f"Uninstalled {installed_name}; removed checkout at {removed}")
+            return 0
         if action == "where":
             print(target)
             return 0
+        manifest = Manifest.from_path(target / "ownbox.yaml", item["repo"])
         if action == "info":
             print(f"{installed_name} — {manifest.description}")
             print(f"Repository: https://github.com/{item['repo']}")

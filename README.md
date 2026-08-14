@@ -46,6 +46,7 @@ ownbox list
 printcam photo --output latest.jpg
 printcam update
 printcam info
+ownbox uninstall printcam
 ```
 
 The first sync defaults to the GitHub account authenticated by `gh`. To use an organization
@@ -88,11 +89,15 @@ printcam --help                ->  .venv/bin/python -m printcam --help
 printcam update                ->  Ownbox updates the Git checkout and reruns setup
 printcam info                  ->  Ownbox shows installation information
 printcam where                 ->  Ownbox prints the checkout directory
+printcam uninstall             ->  Ownbox removes the launcher and checkout
 ```
 
-Only `update`, `info`, and `where` are reserved. All other arguments pass through untouched.
+Only `update`, `uninstall`, `info`, and `where` are reserved. All other arguments pass through untouched.
 If the underlying app itself needs one of those words, use `--` to bypass routing—for example,
 `printcam -- update` passes `-- update` to PrintCAM.
+
+Use `ownbox uninstall printcam --keep-files` to unregister the tool and remove its launcher
+without deleting its checkout.
 
 Commit the file to the repository's default branch and run `ownbox sync`. The repository was
 already searchable; its new setup and entry command will now be available. No change to a central
