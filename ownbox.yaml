@@ -1,0 +1,13 @@
+schema: 1
+name: ownbox
+description: Find, install, and update your own tools from GitHub.
+homepage: https://github.com/BogdanStamenovic/ownbox
+tags: [cli, github, developer-tools, python]
+install:
+  platforms: [linux, darwin]
+  setup:
+    - python -m venv .venv
+    - .venv/bin/pip install -e .
+commands:
+  test: .venv/bin/pytest
+  doctor: .venv/bin/ownbox doctor

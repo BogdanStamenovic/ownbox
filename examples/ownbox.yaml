@@ -1,0 +1,17 @@
+schema: 1
+name: example-tool
+description: One sentence explaining what the tool does.
+homepage: https://github.com/your-name/example-tool
+tags:
+  - cli
+  - raspberry-pi
+install:
+  platforms:
+    - linux
+    - darwin
+  setup:
+    - python -m venv .venv
+    - .venv/bin/pip install -e .
+commands:
+  run: .venv/bin/python -m example_tool
+  test: .venv/bin/python -m pytest
