@@ -21,6 +21,7 @@ class Manifest:
     platforms: tuple[str, ...] = ()
     setup: tuple[str, ...] = ()
     commands: dict[str, str] = field(default_factory=dict)
+    command: str | None = None
     schema: int = 1
     homepage: str | None = None
 
@@ -55,6 +56,7 @@ class Manifest:
             raise ManifestError("install must be an object")
         setup = install.get("setup") or []
         commands = data.get("commands") or {}
+        command = data.get("command")
         tags = data.get("tags") or []
         platforms = install.get("platforms") or []
         if not isinstance(setup, list) or not all(isinstance(v, str) for v in setup):
@@ -63,6 +65,8 @@ class Manifest:
             isinstance(k, str) and isinstance(v, str) for k, v in commands.items()
         ):
             raise ManifestError("commands must map names to shell commands")
+        if command is not None and (not isinstance(command, str) or not command.strip()):
+            raise ManifestError("command must be a non-empty shell command")
         for label, values in (("tags", tags), ("install.platforms", platforms)):
             if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
                 raise ManifestError(f"{label} must be a list of strings")
@@ -76,6 +80,7 @@ class Manifest:
             platforms=tuple(platforms),
             setup=tuple(setup),
             commands=dict(commands),
+            command=command.strip() if command else commands.get("default"),
             homepage=data.get("homepage"),
         )
 
@@ -89,6 +94,8 @@ class Manifest:
             "install": {"platforms": list(self.platforms), "setup": list(self.setup)},
             "commands": self.commands,
         }
+        if self.command:
+            result["command"] = self.command
         if self.homepage:
             result["homepage"] = self.homepage
         return result

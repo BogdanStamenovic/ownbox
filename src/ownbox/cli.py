@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -11,7 +12,30 @@ import yaml
 from . import __version__
 from .github import GitHubClient, GitHubError
 from .manifest import Manifest, ManifestError
-from .store import Catalog, config_home, install, installations, new_catalog, update
+from .store import (
+    Catalog,
+    bin_home,
+    config_home,
+    install,
+    installations,
+    new_catalog,
+    update,
+)
+
+TOP_LEVEL_COMMANDS = {
+    "sync",
+    "search",
+    "info",
+    "install",
+    "add",
+    "list",
+    "ls",
+    "update",
+    "upgrade",
+    "run",
+    "init",
+    "doctor",
+}
 
 
 def owner_from_config() -> str | None:
@@ -97,13 +121,25 @@ def build_parser() -> argparse.ArgumentParser:
     init = sub.add_parser("init", help="create an ownbox.yaml in the current repository")
     init.add_argument("--name", default=Path.cwd().name)
     init.add_argument("--description", default="TODO: describe this tool")
+    init.add_argument(
+        "--command",
+        dest="entry_command",
+        metavar="COMMAND",
+        help="entry command that receives all non-Ownbox arguments",
+    )
+    init.add_argument(
+        "--setup", action="append", default=[], metavar="COMMAND", help="setup command; repeat as needed"
+    )
 
     sub.add_parser("doctor", help="check local dependencies and GitHub login")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    raw_args = list(sys.argv[1:] if argv is None else argv)
+    if raw_args and not raw_args[0].startswith("-") and raw_args[0] not in TOP_LEVEL_COMMANDS:
+        return dispatch_tool(raw_args[0], raw_args[1:])
+    args = build_parser().parse_args(raw_args)
     try:
         if args.command == "sync":
             catalog = get_catalog(refresh=True, owner=args.owner)
@@ -122,16 +158,17 @@ def main(argv: list[str] | None = None) -> int:
                 print("Setup:")
                 for command in tool.setup:
                     print(f"  $ {command}")
-            if tool.commands:
-                print("Commands:")
-                for name, command in tool.commands.items():
-                    print(f"  {name:<14} {command}")
+            if tool.command:
+                print(f"Entry command: {tool.command}")
         elif args.command in {"install", "add"}:
             tool = get_catalog().get(args.name)
             if not confirm_setup(tool, args.yes):
                 return 2
             target = install(tool, args.path)
             print(f"Installed {tool.name} at {target}")
+            print(f"Command: {bin_home() / tool.name}")
+            if str(bin_home()) not in os.environ.get("PATH", "").split(os.pathsep):
+                print(f"Add {bin_home()} to PATH to invoke '{tool.name}' directly.")
         elif args.command in {"list", "ls"}:
             state = installations()
             if not state:
@@ -142,34 +179,31 @@ def main(argv: list[str] | None = None) -> int:
             target = update(args.name)
             print(f"Updated {args.name} at {target}")
         elif args.command == "run":
-            state = installations()
-            if args.name not in state:
-                raise RuntimeError(f"{args.name!r} is not installed")
-            target = Path(state[args.name]["path"])
-            manifest = Manifest.from_path(target / "ownbox.yaml", state[args.name]["repo"])
-            if args.task not in manifest.commands:
-                raise RuntimeError(f"unknown command {args.task!r}; choose: {', '.join(manifest.commands)}")
-            command = manifest.commands[args.task]
-            if args.args:
-                command += " " + " ".join(shlex_quote(value) for value in args.args)
-            return subprocess.run(command, cwd=target, shell=True, check=False).returncode
+            return dispatch_tool(args.name, [args.task, *args.args])
         elif args.command == "init":
             path = Path("ownbox.yaml")
             if path.exists():
                 raise RuntimeError("ownbox.yaml already exists")
+            command = args.entry_command
+            if not command and sys.stdin.isatty():
+                command = input("Project entry command: ").strip()
+            if not command:
+                raise RuntimeError("an entry command is required; use --command 'your command'")
             data = {
                 "schema": 1,
                 "name": args.name,
                 "description": args.description,
                 "tags": [],
-                "install": {"platforms": ["linux"], "setup": []},
-                "commands": {},
+                "install": {"platforms": ["linux"], "setup": args.setup},
+                "command": command,
             }
             path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
             print(f"Created {path}; edit it, commit it, then run 'ownbox sync'.")
         elif args.command == "doctor":
             print(f"git: {'ok' if shutil.which('git') else 'missing'}")
             print(f"gh:  {'ok' if shutil.which('gh') else 'missing (public repos only)'}")
+            on_path = str(bin_home()) in os.environ.get("PATH", "").split(os.pathsep)
+            print(f"command directory: {bin_home()} ({'on PATH' if on_path else 'not on PATH'})")
             try:
                 user = GitHubClient().current_user()
                 print(f"GitHub login: {user}")
@@ -190,6 +224,45 @@ def shlex_quote(value: str) -> str:
     import shlex
 
     return shlex.quote(value)
+
+
+def installed_tool(name: str) -> tuple[str, dict]:
+    state = installations()
+    matches = [(key, item) for key, item in state.items() if key.casefold() == name.casefold()]
+    if not matches:
+        raise RuntimeError(f"{name!r} is not installed")
+    return matches[0]
+
+
+def dispatch_tool(name: str, arguments: list[str]) -> int:
+    try:
+        installed_name, item = installed_tool(name)
+        target = Path(item["path"])
+        manifest = Manifest.from_path(target / "ownbox.yaml", item["repo"])
+        action = arguments[0] if arguments else None
+        if action == "update":
+            updated = update(installed_name)
+            print(f"Updated {installed_name} at {updated}")
+            return 0
+        if action == "where":
+            print(target)
+            return 0
+        if action == "info":
+            print(f"{installed_name} — {manifest.description}")
+            print(f"Repository: https://github.com/{item['repo']}")
+            print(f"Installed: {target}")
+            return 0
+        if not manifest.command:
+            raise RuntimeError(
+                f"{installed_name!r} has no entry command; add 'command:' to ownbox.yaml"
+            )
+        command = manifest.command
+        if arguments:
+            command += " " + " ".join(shlex_quote(value) for value in arguments)
+        return subprocess.run(command, cwd=target, shell=True, check=False).returncode
+    except (ManifestError, RuntimeError, KeyError, subprocess.CalledProcessError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":

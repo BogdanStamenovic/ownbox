@@ -12,6 +12,4 @@ install:
   setup:
     - python -m venv .venv
     - .venv/bin/pip install -e .
-commands:
-  run: .venv/bin/python -m example_tool
-  test: .venv/bin/python -m pytest
+command: .venv/bin/python -m example_tool

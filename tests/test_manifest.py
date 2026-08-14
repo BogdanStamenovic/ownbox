@@ -38,6 +38,8 @@ def test_rejects_invalid_manifest(text, message):
 
 
 def test_round_trip_keeps_repository():
-    original = Manifest(name="demo", description="Demo", repo="me/demo", tags=("cli",))
+    original = Manifest(
+        name="demo", description="Demo", repo="me/demo", tags=("cli",), command="bin/demo"
+    )
     restored = Manifest.from_dict(original.to_dict(), original.repo)
     assert restored == original
