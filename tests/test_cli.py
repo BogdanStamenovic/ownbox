@@ -46,13 +46,18 @@ def test_init_uses_current_platform(tmp_path, monkeypatch):
 
 
 def test_tool_arguments_pass_through_to_entry_command(tmp_path, monkeypatch):
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(caller)
     monkeypatch.setattr("ownbox.cli.current_platform", lambda: "linux")
-    (tmp_path / "ownbox.yaml").write_text(
+    (checkout / "ownbox.yaml").write_text(
         "schema: 1\nname: demo\ndescription: Demo\ncommand: bin/demo\n"
     )
     monkeypatch.setattr(
         "ownbox.cli.installations",
-        lambda: {"demo": {"path": str(tmp_path), "repo": "me/demo"}},
+        lambda: {"demo": {"path": str(checkout), "repo": "me/demo"}},
     )
     calls = []
 
@@ -65,8 +70,38 @@ def test_tool_arguments_pass_through_to_entry_command(tmp_path, monkeypatch):
 
     monkeypatch.setattr("ownbox.cli.subprocess.run", fake_run)
     assert dispatch_tool("demo", ["render", "two words", "--fast"]) == 0
-    assert calls[0][0] == "bin/demo render 'two words' --fast"
-    assert calls[0][1]["cwd"] == tmp_path
+    assert calls[0][0] == f"{checkout}/bin/demo render 'two words' --fast"
+    assert calls[0][1]["cwd"] == caller
+    assert calls[0][1]["env"]["OWNBOX_TOOL_DIR"] == str(checkout)
+
+
+def test_path_entry_command_runs_unchanged_from_callers_directory(tmp_path, monkeypatch):
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    monkeypatch.chdir(caller)
+    monkeypatch.setattr("ownbox.cli.current_platform", lambda: "linux")
+    (checkout / "ownbox.yaml").write_text(
+        "schema: 1\nname: demo\ndescription: Demo\ncommand: python -m demo\n"
+    )
+    monkeypatch.setattr(
+        "ownbox.cli.installations",
+        lambda: {"demo": {"path": str(checkout), "repo": "me/demo"}},
+    )
+    calls = []
+
+    class Result:
+        returncode = 0
+
+    monkeypatch.setattr(
+        "ownbox.cli.subprocess.run",
+        lambda command, **kwargs: calls.append((command, kwargs)) or Result(),
+    )
+
+    assert dispatch_tool("demo", []) == 0
+    assert calls[0][0] == "python -m demo"
+    assert calls[0][1]["cwd"] == caller
 
 
 def test_named_launcher_uses_its_own_entry_command(tmp_path, monkeypatch):
@@ -96,7 +131,7 @@ def test_named_launcher_uses_its_own_entry_command(tmp_path, monkeypatch):
     )
 
     assert dispatch_tool("helper", ["two words"]) == 0
-    assert calls[0][0] == "bin/helper 'two words'"
+    assert calls[0][0] == f"{tmp_path}/bin/helper 'two words'"
 
 
 def test_windows_tool_arguments_use_windows_quoting(tmp_path, monkeypatch):
@@ -119,7 +154,7 @@ def test_windows_tool_arguments_use_windows_quoting(tmp_path, monkeypatch):
     )
 
     assert dispatch_tool("demo", ["render", "two words", "--fast"]) == 0
-    assert calls[0][0] == 'bin\\demo.exe render "two words" --fast'
+    assert calls[0][0] == f'{tmp_path}/bin\\demo.exe render "two words" --fast'
 
 
 def test_uninstall_command_keeps_files_when_requested(tmp_path, monkeypatch, capsys):

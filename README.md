@@ -107,12 +107,16 @@ commands:
   fiotransfer:
     linux: ./ownbox.sh fiotransfer
     darwin: ./ownbox.sh fiotransfer
-    windows: 'powershell.exe -File .\fiotransfer.ps1 fiotransfer'
+    windows: 'powershell.exe -File "$env:OWNBOX_TOOL_DIR\fiotransfer.ps1" fiotransfer'
   fioget:
     linux: ./ownbox.sh fioget
     darwin: ./ownbox.sh fioget
-    windows: 'powershell.exe -File .\fiotransfer.ps1 fioget'
+    windows: 'powershell.exe -File "$env:OWNBOX_TOOL_DIR\fiotransfer.ps1" fioget'
 ```
+
+Tools run with the working directory from which the launcher (or `ownbox run`) was invoked.
+Checkout-relative entry executables such as `.venv/bin/python` and `./ownbox.sh` are resolved
+automatically. The checkout path is also available to entry commands as `OWNBOX_TOOL_DIR`.
 
 `install.setup` may be either one list used everywhere or a mapping with `linux`, `darwin`,
 `windows`, and optional `default` keys. `command` similarly accepts either one string or a

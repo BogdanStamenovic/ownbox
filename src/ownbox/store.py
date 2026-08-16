@@ -181,7 +181,7 @@ def install(tool: Manifest, destination: Path | None = None) -> Path:
         if name.casefold() in occupied:
             raise RuntimeError(f"command is already provided by an installed tool: {name}")
         check_launcher(name)
-    target = destination or data_home() / "tools" / tool.name
+    target = (destination or data_home() / "tools" / tool.name).expanduser().resolve()
     if target.exists():
         raise RuntimeError(f"destination already exists: {target}")
     target.parent.mkdir(parents=True, exist_ok=True)

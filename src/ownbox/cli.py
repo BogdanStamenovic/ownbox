@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -304,8 +306,6 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def shlex_quote(value: str) -> str:
-    import shlex
-
     return shlex.quote(value)
 
 
@@ -313,6 +313,30 @@ def shell_join(arguments: list[str]) -> str:
     if current_platform() == "windows":
         return subprocess.list2cmdline(arguments)
     return " ".join(shlex_quote(value) for value in arguments)
+
+
+def resolve_entry_executable(command: str, checkout: Path) -> str:
+    """Make a checkout-relative entry executable usable from the caller's directory."""
+    match = re.match(r'^\s*(?:"(?:[^"\\]|\\.)*"|\'(?:[^\']*)\'|[^\s]+)', command)
+    if not match:
+        return command
+    executable = match.group(0).strip()
+    try:
+        parsed = shlex.split(executable, posix=current_platform() != "windows")[0]
+    except (ValueError, IndexError):
+        return command
+    parsed = parsed.strip('"')
+    if Path(parsed).is_absolute() or not (
+        parsed.startswith(".") or "/" in parsed or "\\" in parsed
+    ):
+        return command
+    resolved = str(checkout / parsed)
+    quoted = (
+        subprocess.list2cmdline([resolved])
+        if current_platform() == "windows"
+        else shlex_quote(resolved)
+    )
+    return command[: match.start()] + quoted + command[match.end() :]
 
 
 def installed_tool(name: str) -> tuple[str, dict]:
@@ -362,9 +386,14 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             raise RuntimeError(
                 f"{name!r} has no entry command; add it to 'command' or 'commands' in ownbox.yaml"
             )
+        command = resolve_entry_executable(command, target)
         if arguments:
             command += " " + shell_join(arguments)
-        return subprocess.run(command, cwd=target, shell=True, check=False).returncode
+        environment = os.environ.copy()
+        environment["OWNBOX_TOOL_DIR"] = str(target)
+        return subprocess.run(
+            command, cwd=Path.cwd(), env=environment, shell=True, check=False
+        ).returncode
     except (ManifestError, RuntimeError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
