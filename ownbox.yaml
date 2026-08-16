@@ -4,8 +4,23 @@ description: Find, install, and update your own tools from GitHub.
 homepage: https://github.com/BogdanStamenovic/ownbox
 tags: [cli, github, developer-tools, python]
 install:
-  platforms: [linux, darwin]
+  platforms: [linux, darwin, windows]
   setup:
-    - python -m venv .venv
-    - .venv/bin/pip install -e .
-command: .venv/bin/ownbox
+    linux:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    darwin:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    windows:
+      - python -m venv .venv
+      - '.venv\Scripts\python.exe -m pip install -e .'
+  update:
+    linux: [.venv/bin/python -m pip install -e .]
+    darwin: [.venv/bin/python -m pip install -e .]
+    windows: ['.venv\Scripts\python.exe -m pip install -e .']
+  remove: []
+command:
+  linux: .venv/bin/ownbox
+  darwin: .venv/bin/ownbox
+  windows: '.venv\Scripts\ownbox.exe'

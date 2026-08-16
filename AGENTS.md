@@ -12,8 +12,12 @@ ownbox init --command '.venv/bin/python -m my_tool' \
   --setup '.venv/bin/pip install -e .'
 ```
 
-Edit the generated name, description, tags, supported platforms, setup commands, and entry
-command as needed. Commit and push `ownbox.yaml`, then refresh the local catalog:
+Edit the generated name, description, tags, supported platforms, lifecycle commands, and entry
+command as needed. For cross-platform tools, `install.setup`, `install.update`, `install.remove`,
+and `command` may use `linux`, `darwin`, `windows`, and optional `default` mappings. If
+`install.update` is absent, Ownbox reruns `install.setup` after pulling. `install.remove` runs before
+the checkout is deleted. Commit and push `ownbox.yaml`, then refresh
+the local catalog:
 
 ```bash
 ownbox sync

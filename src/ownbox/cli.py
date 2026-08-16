@@ -11,13 +11,14 @@ import yaml
 
 from . import __version__
 from .github import GitHubClient, GitHubError
-from .manifest import Manifest, ManifestError
+from .manifest import Manifest, ManifestError, current_platform
 from .store import (
     Catalog,
     bin_home,
     config_home,
     install,
     installations,
+    launcher_path,
     new_catalog,
     uninstall,
     update,
@@ -80,16 +81,23 @@ def print_tools(tools: list[Manifest]) -> None:
         print(f"{tool.name:<{width}}  {tool.description}{tags}")
 
 
-def confirm_setup(tool: Manifest, assume_yes: bool) -> bool:
-    if not tool.setup or assume_yes:
+def confirm_commands(name: str, action: str, commands: tuple[str, ...], assume_yes: bool) -> bool:
+    if not commands or assume_yes:
         return True
-    print(f"Ownbox will run these commands from the cloned {tool.name} directory:")
-    for command in tool.setup:
+    print(f"Ownbox will run these {action} commands from the {name} checkout:")
+    for command in commands:
         print(f"  $ {command}")
     if not sys.stdin.isatty():
-        print("Use --yes to approve setup commands in a non-interactive session.", file=sys.stderr)
+        print(
+            f"Use --yes to approve {action} commands in a non-interactive session.",
+            file=sys.stderr,
+        )
         return False
     return input("Continue? [y/N] ").strip().casefold() in {"y", "yes"}
+
+
+def confirm_setup(tool: Manifest, assume_yes: bool) -> bool:
+    return confirm_commands(tool.name, "setup", tool.setup, assume_yes)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -119,12 +127,14 @@ def build_parser() -> argparse.ArgumentParser:
     remove.add_argument(
         "--keep-files", action="store_true", help="keep the checkout while removing the launcher"
     )
+    remove.add_argument("-y", "--yes", action="store_true", help="approve app remove commands")
 
     sub.add_parser("list", aliases=["ls"], help="list installed tools")
     upgrade = sub.add_parser(
-        "update", aliases=["upgrade"], help="pull and set up an installed tool"
+        "update", aliases=["upgrade"], help="pull and update an installed tool"
     )
     upgrade.add_argument("name")
+    upgrade.add_argument("-y", "--yes", action="store_true", help="approve app update commands")
 
     run = sub.add_parser("run", help="run a named command from an installed tool")
     run.add_argument("name")
@@ -146,6 +156,20 @@ def build_parser() -> argparse.ArgumentParser:
         default=[],
         metavar="COMMAND",
         help="setup command; repeat as needed",
+    )
+    init.add_argument(
+        "--update",
+        action="append",
+        default=[],
+        metavar="COMMAND",
+        help="native update command; repeat as needed",
+    )
+    init.add_argument(
+        "--remove",
+        action="append",
+        default=[],
+        metavar="COMMAND",
+        help="native cleanup command; repeat as needed",
     )
 
     sub.add_parser("doctor", help="check local dependencies and GitHub login")
@@ -175,6 +199,14 @@ def main(argv: list[str] | None = None) -> int:
                 print("Setup:")
                 for command in tool.setup:
                     print(f"  $ {command}")
+            if tool.update:
+                print("Update:")
+                for command in tool.update:
+                    print(f"  $ {command}")
+            if tool.remove:
+                print("Remove:")
+                for command in tool.remove:
+                    print(f"  $ {command}")
             if tool.command:
                 print(f"Entry command: {tool.command}")
         elif args.command in {"install", "add"}:
@@ -183,11 +215,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             target = install(tool, args.path)
             print(f"Installed {tool.name} at {target}")
-            print(f"Command: {bin_home() / tool.name}")
+            print(f"Command: {launcher_path(tool.name)}")
             if str(bin_home()) not in os.environ.get("PATH", "").split(os.pathsep):
                 print(f"Add {bin_home()} to PATH to invoke '{tool.name}' directly.")
         elif args.command in {"uninstall", "remove"}:
-            target = uninstall(args.name, keep_files=args.keep_files)
+            target = uninstall(
+                args.name,
+                keep_files=args.keep_files,
+                approve_commands=lambda commands: confirm_commands(
+                    args.name, "remove", commands, args.yes
+                ),
+            )
             if args.keep_files:
                 print(f"Uninstalled {args.name}; kept checkout at {target}")
             else:
@@ -199,7 +237,12 @@ def main(argv: list[str] | None = None) -> int:
             for name, item in sorted(state.items()):
                 print(f"{name:<24} {item['path']}")
         elif args.command in {"update", "upgrade"}:
-            target = update(args.name)
+            target = update(
+                args.name,
+                approve_commands=lambda commands: confirm_commands(
+                    args.name, "update", commands, args.yes
+                ),
+            )
             print(f"Updated {args.name} at {target}")
         elif args.command == "run":
             return dispatch_tool(args.name, [args.task, *args.args])
@@ -217,7 +260,12 @@ def main(argv: list[str] | None = None) -> int:
                 "name": args.name,
                 "description": args.description,
                 "tags": [],
-                "install": {"platforms": ["linux"], "setup": args.setup},
+                "install": {
+                    "platforms": [current_platform()],
+                    "setup": args.setup,
+                    "update": args.update,
+                    "remove": args.remove,
+                },
                 "command": command,
             }
             path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
@@ -255,6 +303,12 @@ def shlex_quote(value: str) -> str:
     return shlex.quote(value)
 
 
+def shell_join(arguments: list[str]) -> str:
+    if current_platform() == "windows":
+        return subprocess.list2cmdline(arguments)
+    return " ".join(shlex_quote(value) for value in arguments)
+
+
 def installed_tool(name: str) -> tuple[str, dict]:
     state = installations()
     matches = [(key, item) for key, item in state.items() if key.casefold() == name.casefold()]
@@ -269,11 +323,27 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
         target = Path(item["path"])
         action = arguments[0] if arguments else None
         if action == "update":
-            updated = update(installed_name)
+            assume_yes = arguments[1:] in (["-y"], ["--yes"])
+            if arguments[1:] and not assume_yes:
+                raise RuntimeError("usage: <app> update [--yes]")
+            updated = update(
+                installed_name,
+                approve_commands=lambda commands: confirm_commands(
+                    installed_name, "update", commands, assume_yes
+                ),
+            )
             print(f"Updated {installed_name} at {updated}")
             return 0
-        if action == "uninstall":
-            removed = uninstall(installed_name)
+        if action in {"uninstall", "remove"}:
+            assume_yes = arguments[1:] in (["-y"], ["--yes"])
+            if arguments[1:] and not assume_yes:
+                raise RuntimeError(f"usage: <app> {action} [--yes]")
+            removed = uninstall(
+                installed_name,
+                approve_commands=lambda commands: confirm_commands(
+                    installed_name, "remove", commands, assume_yes
+                ),
+            )
             print(f"Uninstalled {installed_name}; removed checkout at {removed}")
             return 0
         if action == "where":
@@ -291,7 +361,7 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             )
         command = manifest.command
         if arguments:
-            command += " " + " ".join(shlex_quote(value) for value in arguments)
+            command += " " + shell_join(arguments)
         return subprocess.run(command, cwd=target, shell=True, check=False).returncode
     except (ManifestError, RuntimeError, KeyError, subprocess.CalledProcessError) as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -4,7 +4,7 @@ Ownbox turns your GitHub account into a searchable personal tool shelf. Every re
 searchable and cloneable immediately. Put a small `ownbox.yaml` manifest in a repository to
 also teach Ownbox how to set it up and which executable receives its arguments.
 
-It works with public and private repositories and has no server or central registry.
+It works on Linux, macOS, and Windows with public and private repositories and has no server or central registry.
 Your GitHub account is the source of truth; the local catalog is just a fast cache.
 
 ## Install
@@ -24,6 +24,12 @@ git clone https://github.com/BogdanStamenovic/ownbox.git
 cd ownbox
 python -m venv .venv
 .venv/bin/pip install -e '.[dev]'
+```
+
+On Windows PowerShell, use:
+
+```powershell
+.venv\Scripts\python.exe -m pip install -e ".[dev]"
 ```
 
 ## Use
@@ -60,7 +66,9 @@ that Ownbox does not handle itself:
 ```bash
 ownbox init --command '.venv/bin/python -m printcam' \
   --setup 'python -m venv .venv' \
-  --setup '.venv/bin/pip install -e .'
+  --setup '.venv/bin/pip install -e .' \
+  --update '.venv/bin/pip install -e .' \
+  --remove '.venv/bin/python -m printcam cleanup'
 ```
 
 You can also create `ownbox.yaml` yourself:
@@ -72,32 +80,63 @@ description: Set up a small Linux print camera automatically.
 tags: [camera, linux, raspberry-pi]
 
 install:
-  platforms: [linux]
+  platforms: [linux, darwin, windows]
   setup:
-    - python -m venv .venv
-    - .venv/bin/pip install -e .
+    linux:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    darwin:
+      - python -m venv .venv
+      - .venv/bin/python -m pip install -e .
+    windows:
+      - python -m venv .venv
+      - '.venv\Scripts\python.exe -m pip install -e .'
 
-command: .venv/bin/python -m printcam
+command:
+  linux: .venv/bin/python -m printcam
+  darwin: .venv/bin/python -m printcam
+  windows: '.venv\Scripts\python.exe -m printcam'
 ```
 
-After installation, Ownbox creates `~/.local/bin/printcam`. The launcher always goes through
-Ownbox, but normal arguments pass through to the configured command:
+`install.setup` may be either one list used everywhere or a mapping with `linux`, `darwin`,
+`windows`, and optional `default` keys. `command` similarly accepts either one string or a
+platform mapping. Use mappings whenever virtual-environment executable paths differ.
+
+After installation, Ownbox creates `~/.local/bin/printcam` on Linux/macOS or
+`%LOCALAPPDATA%\ownbox\bin\printcam.cmd` on Windows. The launcher always goes through Ownbox,
+but normal arguments pass through to the configured command:
 
 ```text
 printcam photo --output a.jpg  ->  .venv/bin/python -m printcam photo --output a.jpg
 printcam --help                ->  .venv/bin/python -m printcam --help
-printcam update                ->  Ownbox updates the Git checkout and reruns setup
+printcam update                ->  Ownbox pulls and runs its update commands (or setup fallback)
 printcam info                  ->  Ownbox shows installation information
 printcam where                 ->  Ownbox prints the checkout directory
 printcam uninstall             ->  Ownbox removes the launcher and checkout
+printcam remove                ->  Alias for uninstall, including app-native cleanup
 ```
 
-Only `update`, `uninstall`, `info`, and `where` are reserved. All other arguments pass through untouched.
+Only `update`, `uninstall`, `remove`, `info`, and `where` are reserved. All other arguments pass through untouched.
 If the underlying app itself needs one of those words, use `--` to bypass routing—for example,
 `printcam -- update` passes `-- update` to PrintCAM.
 
 Use `ownbox uninstall printcam --keep-files` to unregister the tool and remove its launcher
 without deleting its checkout.
+
+Apps can provide native update and removal commands alongside setup:
+
+```yaml
+install:
+  setup: [python -m pip install -e .]
+  update: [python -m pip install -U -e .]
+  remove: [python -m printcam cleanup]
+```
+
+All three fields accept platform mappings. `ownbox update printcam` pulls with a fast-forward-only
+Git update, then runs `install.update`. Older manifests without it continue to rerun
+`install.setup`. `ownbox uninstall printcam` and `printcam remove` run `install.remove` before
+removing the launcher and checkout. Ownbox displays lifecycle commands for approval; pass `--yes`
+only for repositories you trust. If a remove command fails, Ownbox leaves the app installed.
 
 Commit the file to the repository's default branch and run `ownbox sync`. The repository was
 already searchable; its new setup and entry command will now be available. No change to a central
@@ -113,10 +152,12 @@ registry is needed.
 | `tags` | no | Search terms such as `python`, `cli`, or `raspberry-pi` |
 | `homepage` | no | Project or documentation URL |
 | `install.platforms` | no | Any of `linux`, `darwin`, or `windows` |
-| `install.setup` | no | Shell commands run in order after cloning |
-| `command` | for launchers | Entry command that receives normal CLI arguments |
+| `install.setup` | no | Setup-command list, or mapping by platform |
+| `install.update` | no | Native update-command list, or mapping by platform |
+| `install.remove` | no | Native cleanup-command list, or mapping by platform |
+| `command` | for launchers | Entry command string, or mapping by platform |
 
-Setup commands are code from the repository. Ownbox displays them and asks for confirmation
+Lifecycle commands are code from the repository. Ownbox displays them and asks for confirmation
 before running them. Use `--yes` only for repositories you trust.
 
 ## Where files go
@@ -125,5 +166,9 @@ before running them. Use `--yes` only for repositories you trust.
 - Launchers: `$OWNBOX_BIN_DIR` (usually `~/.local/bin`)
 - Catalog: `$XDG_CACHE_HOME/ownbox/catalog.json`
 - Config: `$XDG_CONFIG_HOME/ownbox/config.yaml`
+
+On Windows, tools and `.cmd` launchers default to `%LOCALAPPDATA%\ownbox`, the catalog is under
+`%LOCALAPPDATA%\ownbox\cache`, and configuration is under `%APPDATA%\ownbox`. Add
+`%LOCALAPPDATA%\ownbox\bin` to `PATH`, or set `OWNBOX_BIN_DIR` to a directory already on `PATH`.
 
 Run `ownbox doctor` if authentication or dependencies are not working.
