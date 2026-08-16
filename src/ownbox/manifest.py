@@ -88,7 +88,7 @@ class Manifest:
             if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
                 raise ManifestError(f"install.{field_name} must be a list of shell commands")
             lifecycle[field_name] = value
-        commands = data.get("commands") or {}
+        raw_commands = data.get("commands") or {}
         raw_command = data.get("command")
         if isinstance(raw_command, dict) and not all(
             isinstance(value, str) and value.strip() for value in raw_command.values()
@@ -97,10 +97,25 @@ class Manifest:
         command = platform_value(raw_command, "command")
         tags = data.get("tags") or []
         platforms = install.get("platforms") or []
-        if not isinstance(commands, dict) or not all(
-            isinstance(k, str) and isinstance(v, str) for k, v in commands.items()
-        ):
-            raise ManifestError("commands must map names to shell commands")
+        if not isinstance(raw_commands, dict):
+            raise ManifestError("commands must map launcher names to shell commands")
+        commands: dict[str, str] = {}
+        for launcher_name, raw_value in raw_commands.items():
+            if not isinstance(launcher_name, str) or not re.fullmatch(
+                r"[A-Za-z0-9][A-Za-z0-9._-]*", launcher_name
+            ):
+                raise ManifestError(
+                    "command names must contain only letters, numbers, '.', '_' and '-'"
+                )
+            if isinstance(raw_value, dict) and not all(
+                isinstance(value, str) and value.strip() for value in raw_value.values()
+            ):
+                raise ManifestError("commands platform values must be non-empty shell commands")
+            value = platform_value(raw_value, f"commands.{launcher_name}")
+            if value is not None and (not isinstance(value, str) or not value.strip()):
+                raise ManifestError("commands must map launcher names to shell commands")
+            if value:
+                commands[launcher_name] = value.strip()
         if command is not None and (not isinstance(command, str) or not command.strip()):
             raise ManifestError("command must be a non-empty shell command or platform mapping")
         for label, values in (("tags", tags), ("install.platforms", platforms)):
@@ -117,8 +132,8 @@ class Manifest:
             setup=tuple(lifecycle["setup"]),
             update=tuple(lifecycle["update"]),
             remove=tuple(lifecycle["remove"]),
-            commands=dict(commands),
-            command=command.strip() if command else commands.get("default"),
+            commands=commands,
+            command=command.strip() if command else None,
             homepage=data.get("homepage"),
         )
 
@@ -142,3 +157,18 @@ class Manifest:
         if self.homepage:
             result["homepage"] = self.homepage
         return result
+
+    def entry_commands(self) -> dict[str, str]:
+        """Return every launcher name and its checkout-local entry command."""
+        result = {name: command for name, command in self.commands.items() if name != "default"}
+        if self.command:
+            result.setdefault(self.name, self.command)
+        elif default_command := self.commands.get("default"):
+            result.setdefault(self.name, default_command)
+        return result
+
+    def command_for(self, launcher_name: str) -> str | None:
+        for name, command in self.entry_commands().items():
+            if name.casefold() == launcher_name.casefold():
+                return command
+        return None

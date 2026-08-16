@@ -98,6 +98,22 @@ command:
   windows: '.venv\Scripts\python.exe -m printcam'
 ```
 
+Repositories that provide more than one executable can use `commands` instead.
+Ownbox creates a launcher for every key, while all launchers share one checkout
+and lifecycle:
+
+```yaml
+commands:
+  fiotransfer:
+    linux: ./ownbox.sh fiotransfer
+    darwin: ./ownbox.sh fiotransfer
+    windows: 'powershell.exe -File .\fiotransfer.ps1 fiotransfer'
+  fioget:
+    linux: ./ownbox.sh fioget
+    darwin: ./ownbox.sh fioget
+    windows: 'powershell.exe -File .\fiotransfer.ps1 fioget'
+```
+
 `install.setup` may be either one list used everywhere or a mapping with `linux`, `darwin`,
 `windows`, and optional `default` keys. `command` similarly accepts either one string or a
 platform mapping. Use mappings whenever virtual-environment executable paths differ.
@@ -155,7 +171,8 @@ registry is needed.
 | `install.setup` | no | Setup-command list, or mapping by platform |
 | `install.update` | no | Native update-command list, or mapping by platform |
 | `install.remove` | no | Native cleanup-command list, or mapping by platform |
-| `command` | for launchers | Entry command string, or mapping by platform |
+| `command` | one entry form required | Single entry command string, or mapping by platform |
+| `commands` | one entry form required | Launcher-name map whose values are commands or platform mappings |
 
 Lifecycle commands are code from the repository. Ownbox displays them and asks for confirmation
 before running them. Use `--yes` only for repositories you trust.

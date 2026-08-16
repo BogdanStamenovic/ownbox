@@ -20,6 +20,7 @@ from .store import (
     installations,
     launcher_path,
     new_catalog,
+    resolve_installation,
     uninstall,
     update,
 )
@@ -209,13 +210,18 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  $ {command}")
             if tool.command:
                 print(f"Entry command: {tool.command}")
+            if tool.commands:
+                print("Commands:")
+                for name, command in tool.commands.items():
+                    print(f"  {name}: {command}")
         elif args.command in {"install", "add"}:
             tool = get_catalog().get(args.name)
             if not confirm_setup(tool, args.yes):
                 return 2
             target = install(tool, args.path)
             print(f"Installed {tool.name} at {target}")
-            print(f"Command: {launcher_path(tool.name)}")
+            for name in tool.entry_commands() or {tool.name: ""}:
+                print(f"Command: {launcher_path(name)}")
             if str(bin_home()) not in os.environ.get("PATH", "").split(os.pathsep):
                 print(f"Add {bin_home()} to PATH to invoke '{tool.name}' directly.")
         elif args.command in {"uninstall", "remove"}:
@@ -310,11 +316,7 @@ def shell_join(arguments: list[str]) -> str:
 
 
 def installed_tool(name: str) -> tuple[str, dict]:
-    state = installations()
-    matches = [(key, item) for key, item in state.items() if key.casefold() == name.casefold()]
-    if not matches:
-        raise RuntimeError(f"{name!r} is not installed")
-    return matches[0]
+    return resolve_installation(installations(), name)
 
 
 def dispatch_tool(name: str, arguments: list[str]) -> int:
@@ -355,11 +357,11 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             print(f"Repository: https://github.com/{item['repo']}")
             print(f"Installed: {target}")
             return 0
-        if not manifest.command:
+        command = manifest.command_for(name)
+        if not command:
             raise RuntimeError(
-                f"{installed_name!r} has no entry command; add 'command:' to ownbox.yaml"
+                f"{name!r} has no entry command; add it to 'command' or 'commands' in ownbox.yaml"
             )
-        command = manifest.command
         if arguments:
             command += " " + shell_join(arguments)
         return subprocess.run(command, cwd=target, shell=True, check=False).returncode

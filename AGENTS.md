@@ -23,6 +23,10 @@ the local catalog:
 ownbox sync
 ```
 
+For a repository with multiple executables, use a top-level `commands` mapping
+instead of `command`. Each key becomes a launcher and each value is a command
+string or platform mapping; all launchers share the same checkout and lifecycle.
+
 No central registry is involved: GitHub repositories and their manifests are the registry.
 Use `ownbox sync --owner NAME` to select a different user or organization.
 

@@ -44,6 +44,54 @@ def test_launcher_routes_through_ownbox(tmp_path, monkeypatch):
     assert launcher.stat().st_mode & 0o111
 
 
+def test_install_creates_every_named_launcher(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    target = tmp_path / "checkout"
+
+    def fake_run(command, **kwargs):
+        if isinstance(command, list) and command[:2] == ["git", "clone"]:
+            target.mkdir()
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    manifest = Manifest(
+        name="demo",
+        description="Demo",
+        repo="me/demo",
+        commands={"demo": "bin/demo", "helper": "bin/helper"},
+    )
+
+    install(manifest, target)
+
+    assert (tmp_path / "bin" / "demo").exists()
+    assert (tmp_path / "bin" / "helper").exists()
+    assert set(installations()["demo"]["launchers"]) == {"demo", "helper"}
+
+
+def test_uninstall_by_alias_removes_every_launcher(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    (checkout / "ownbox.yaml").write_text(
+        "name: demo\ndescription: Demo\ncommands:\n  demo: bin/demo\n  helper: bin/helper\n"
+    )
+    launchers = {
+        "demo": str(create_launcher("demo")),
+        "helper": str(create_launcher("helper")),
+    }
+    save_installations({"demo": {"path": str(checkout), "repo": "me/demo", "launchers": launchers}})
+
+    uninstall("helper")
+
+    assert not checkout.exists()
+    assert not (tmp_path / "bin" / "demo").exists()
+    assert not (tmp_path / "bin" / "helper").exists()
+
+
 def test_uninstall_removes_checkout_launcher_and_registration(tmp_path, monkeypatch):
     monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
     data_dir = tmp_path / "data"
@@ -137,6 +185,43 @@ def test_update_prefers_native_update_commands_and_falls_back_to_setup(tmp_path,
     update("demo", approve_commands=lambda commands: commands == ("python setup.py",))
 
     assert calls[1] == ("python setup.py", {"cwd": checkout, "shell": True, "check": True})
+
+
+def test_update_refreshes_named_launchers(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    manifest_path = checkout / "ownbox.yaml"
+    manifest_path.write_text(
+        "name: demo\ndescription: Demo\ncommands:\n  demo: bin/demo\n  helper: bin/helper\n"
+    )
+    old_launcher = create_launcher("demo")
+    save_installations(
+        {
+            "demo": {
+                "path": str(checkout),
+                "repo": "me/demo",
+                "launcher": str(old_launcher),
+            }
+        }
+    )
+    monkeypatch.setattr("ownbox.store.subprocess.run", lambda *args, **kwargs: None)
+
+    update("demo")
+
+    assert (tmp_path / "bin" / "demo").exists()
+    assert (tmp_path / "bin" / "helper").exists()
+    assert set(installations()["demo"]["launchers"]) == {"demo", "helper"}
+
+    manifest_path.write_text(
+        "name: demo\ndescription: Demo\ncommands:\n  demo: bin/demo\n  inspect: bin/inspect\n"
+    )
+    update("helper")
+
+    assert not (tmp_path / "bin" / "helper").exists()
+    assert (tmp_path / "bin" / "inspect").exists()
 
 
 def test_windows_launcher_and_platform_directories(tmp_path, monkeypatch):

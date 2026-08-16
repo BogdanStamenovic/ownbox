@@ -69,6 +69,36 @@ def test_tool_arguments_pass_through_to_entry_command(tmp_path, monkeypatch):
     assert calls[0][1]["cwd"] == tmp_path
 
 
+def test_named_launcher_uses_its_own_entry_command(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.cli.current_platform", lambda: "linux")
+    (tmp_path / "ownbox.yaml").write_text(
+        "schema: 1\nname: demo\ndescription: Demo\n"
+        "commands:\n  demo: bin/demo\n  helper: bin/helper\n"
+    )
+    monkeypatch.setattr(
+        "ownbox.cli.installations",
+        lambda: {
+            "demo": {
+                "path": str(tmp_path),
+                "repo": "me/demo",
+                "launchers": {"demo": "/bin/demo", "helper": "/bin/helper"},
+            }
+        },
+    )
+    calls = []
+
+    class Result:
+        returncode = 0
+
+    monkeypatch.setattr(
+        "ownbox.cli.subprocess.run",
+        lambda command, **kwargs: calls.append((command, kwargs)) or Result(),
+    )
+
+    assert dispatch_tool("helper", ["two words"]) == 0
+    assert calls[0][0] == "bin/helper 'two words'"
+
+
 def test_windows_tool_arguments_use_windows_quoting(tmp_path, monkeypatch):
     (tmp_path / "ownbox.yaml").write_text(
         "schema: 1\nname: demo\ndescription: Demo\ncommand: bin\\demo.exe\n"
@@ -96,8 +126,9 @@ def test_uninstall_command_keeps_files_when_requested(tmp_path, monkeypatch, cap
     calls = []
     monkeypatch.setattr(
         "ownbox.cli.uninstall",
-        lambda name, keep_files=False, approve_commands=None: calls.append((name, keep_files))
-        or tmp_path,
+        lambda name, keep_files=False, approve_commands=None: (
+            calls.append((name, keep_files)) or tmp_path
+        ),
     )
 
     assert main(["uninstall", "demo", "--keep-files"]) == 0
