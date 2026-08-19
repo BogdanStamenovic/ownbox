@@ -1,5 +1,10 @@
+import subprocess
+
+import pytest
+
 from ownbox.manifest import Manifest
 from ownbox.store import (
+    COMMAND_TIMEOUT,
     Catalog,
     create_launcher,
     install,
@@ -12,6 +17,26 @@ from ownbox.store import (
 
 def tool(name, description, tags=()):
     return Manifest(name=name, description=description, repo=f"me/{name}", tags=tags)
+
+
+def completed(command, stdout=""):
+    return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+
+def fake_git_run(target, *, show_fails=True, revision="abc123"):
+    """A subprocess.run stand-in that fakes clone/rev-parse/show for a checkout at `target`."""
+
+    def fake_run(command, **kwargs):
+        if isinstance(command, list) and command[:2] == ["git", "clone"]:
+            target.mkdir(parents=True, exist_ok=True)
+            return completed(command)
+        if isinstance(command, list) and "rev-parse" in command:
+            return completed(command, stdout=f"{revision}\n")
+        if isinstance(command, list) and "show" in command and show_fails:
+            raise subprocess.CalledProcessError(1, command)
+        return completed(command)
+
+    return fake_run
 
 
 def test_catalog_searches_names_descriptions_and_tags():
@@ -51,11 +76,7 @@ def test_install_creates_every_named_launcher(tmp_path, monkeypatch):
     monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
     target = tmp_path / "checkout"
 
-    def fake_run(command, **kwargs):
-        if isinstance(command, list) and command[:2] == ["git", "clone"]:
-            target.mkdir()
-
-    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_git_run(target))
     manifest = Manifest(
         name="demo",
         description="Demo",
@@ -68,6 +89,92 @@ def test_install_creates_every_named_launcher(tmp_path, monkeypatch):
     assert (tmp_path / "bin" / "demo").exists()
     assert (tmp_path / "bin" / "helper").exists()
     assert set(installations()["demo"]["launchers"]) == {"demo", "helper"}
+    assert installations()["demo"]["state"] == "complete"
+
+
+def test_install_leaves_tracked_incomplete_entry_when_setup_fails(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    target = tmp_path / "checkout"
+
+    git_run = fake_git_run(target)
+
+    def fake_run(command, **kwargs):
+        if command == "exit 1":
+            raise subprocess.CalledProcessError(1, command)
+        return git_run(command, **kwargs)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    manifest = Manifest(name="demo", description="Demo", repo="me/demo", setup=("exit 1",))
+
+    with pytest.raises(RuntimeError, match="ownbox uninstall demo"):
+        install(manifest, target)
+
+    state = installations()
+    assert state["demo"]["state"] == "incomplete"
+    assert state["demo"]["path"] == str(target)
+    assert target.exists()
+
+    # The incomplete entry must be uninstallable even though setup never finished.
+    uninstall("demo")
+    assert installations() == {}
+    assert not target.exists()
+
+
+def test_install_converts_clone_timeout_to_runtime_error(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+
+    def fake_run(command, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=command, timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    manifest = Manifest(name="demo", description="Demo", repo="me/demo")
+
+    with pytest.raises(RuntimeError, match="timed out"):
+        install(manifest, tmp_path / "checkout")
+
+    assert installations() == {}
+
+
+def test_install_declines_setup_without_cloning(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    calls = []
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", lambda command, **kwargs: calls.append(command)
+    )
+    manifest = Manifest(name="demo", description="Demo", repo="me/demo", setup=("make",))
+
+    with pytest.raises(RuntimeError, match="not approved"):
+        install(manifest, tmp_path / "checkout", approve_commands=lambda commands: False)
+
+    assert calls == []
+    assert installations() == {}
+    assert not (tmp_path / "checkout").exists()
+
+
+def test_install_records_installed_revision(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    target = tmp_path / "checkout"
+
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", fake_git_run(target, revision="deadbeef")
+    )
+    manifest = Manifest(name="demo", description="Demo", repo="me/demo")
+
+    install(manifest, target)
+
+    assert installations()["demo"]["revision"] == "deadbeef"
 
 
 def test_uninstall_by_alias_removes_every_launcher(tmp_path, monkeypatch):
@@ -151,7 +258,12 @@ def test_uninstall_runs_native_remove_commands(tmp_path, monkeypatch):
 
     uninstall("demo", approve_commands=lambda commands: commands == ("python cleanup.py",))
 
-    assert calls == [("python cleanup.py", {"cwd": checkout, "shell": True, "check": True})]
+    assert calls == [
+        (
+            "python cleanup.py",
+            {"cwd": checkout, "shell": True, "check": True, "timeout": COMMAND_TIMEOUT},
+        )
+    ]
     assert not checkout.exists()
 
 
@@ -168,14 +280,24 @@ def test_update_prefers_native_update_commands_and_falls_back_to_setup(tmp_path,
     )
     save_installations({"demo": {"path": str(checkout), "repo": "me/demo"}})
     calls = []
-    monkeypatch.setattr(
-        "ownbox.store.subprocess.run", lambda command, **kwargs: calls.append((command, kwargs))
-    )
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if isinstance(command, list) and "show" in command:
+            raise subprocess.CalledProcessError(1, command)
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
 
     update("demo", approve_commands=lambda commands: commands == ("python update.py",))
 
-    assert calls[0][0] == ["git", "-C", str(checkout), "pull", "--ff-only"]
-    assert calls[1] == ("python update.py", {"cwd": checkout, "shell": True, "check": True})
+    assert calls[0][0] == ["git", "-C", str(checkout), "fetch"]
+    assert calls[1][0] == ["git", "-C", str(checkout), "show", "FETCH_HEAD:ownbox.yaml"]
+    assert calls[2][0] == ["git", "-C", str(checkout), "merge", "--ff-only", "FETCH_HEAD"]
+    assert calls[3] == (
+        "python update.py",
+        {"cwd": checkout, "shell": True, "check": True, "timeout": COMMAND_TIMEOUT},
+    )
 
     calls.clear()
     manifest_path.write_text(
@@ -184,7 +306,60 @@ def test_update_prefers_native_update_commands_and_falls_back_to_setup(tmp_path,
 
     update("demo", approve_commands=lambda commands: commands == ("python setup.py",))
 
-    assert calls[1] == ("python setup.py", {"cwd": checkout, "shell": True, "check": True})
+    assert calls[3] == (
+        "python setup.py",
+        {"cwd": checkout, "shell": True, "check": True, "timeout": COMMAND_TIMEOUT},
+    )
+
+
+def test_update_declining_leaves_checkout_completely_untouched(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    (checkout / "ownbox.yaml").write_text(
+        "name: demo\ndescription: Demo\ninstall:\n  update: [python update.py]\n"
+    )
+    save_installations({"demo": {"path": str(checkout), "repo": "me/demo"}})
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if isinstance(command, list) and "show" in command:
+            raise subprocess.CalledProcessError(1, command)
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="not approved"):
+        update("demo", approve_commands=lambda commands: False)
+
+    # Only fetch + the manifest lookup happened; no merge, no update command, no revision
+    # bump was ever recorded, so the checkout is exactly as it was before update() ran.
+    assert calls == [
+        ["git", "-C", str(checkout), "fetch"],
+        ["git", "-C", str(checkout), "show", "FETCH_HEAD:ownbox.yaml"],
+    ]
+    assert "revision" not in installations()["demo"]
+    assert "updated_at" not in installations()["demo"]
+
+
+def test_update_records_revision_after_fast_forward(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    save_installations({"demo": {"path": str(checkout), "repo": "me/demo"}})
+
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", fake_git_run(checkout, revision="cafef00d")
+    )
+
+    update("demo")
+
+    assert installations()["demo"]["revision"] == "cafef00d"
 
 
 def test_update_refreshes_named_launchers(tmp_path, monkeypatch):
@@ -207,7 +382,7 @@ def test_update_refreshes_named_launchers(tmp_path, monkeypatch):
             }
         }
     )
-    monkeypatch.setattr("ownbox.store.subprocess.run", lambda *args, **kwargs: None)
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_git_run(checkout))
 
     update("demo")
 
@@ -251,11 +426,15 @@ def test_windows_install_runs_selected_setup_and_creates_cmd_launcher(tmp_path, 
     monkeypatch.delenv("OWNBOX_BIN_DIR", raising=False)
     monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
     calls = []
+    checkout = tmp_path / "checkout"
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
         if isinstance(command, list) and command[:2] == ["git", "clone"]:
-            (tmp_path / "checkout").mkdir()
+            checkout.mkdir()
+        if isinstance(command, list) and "rev-parse" in command:
+            return completed(command, stdout="abc123\n")
+        return completed(command)
 
     monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
     manifest = Manifest.from_text(
@@ -275,7 +454,29 @@ command:
     target = install(manifest, tmp_path / "checkout")
 
     assert target == tmp_path / "checkout"
-    assert calls[1][0] == r".venv\Scripts\python.exe -m pip install -e ."
-    assert calls[1][1]["shell"] is True
+    assert calls[2][0] == r".venv\Scripts\python.exe -m pip install -e ."
+    assert calls[2][1]["shell"] is True
     assert (tmp_path / "local" / "ownbox" / "bin" / "demo.cmd").exists()
     assert installations()["demo"]["path"] == str(target)
+
+
+def test_save_installations_is_atomic_and_leaves_no_temp_files(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+
+    save_installations({"demo": {"path": "/somewhere", "repo": "me/demo"}})
+
+    data_dir = tmp_path / "ownbox"
+    assert [entry.name for entry in data_dir.iterdir()] == ["installed.json"]
+    assert installations() == {"demo": {"path": "/somewhere", "repo": "me/demo"}}
+
+
+def test_installations_raises_clear_error_on_corrupt_json(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path))
+    path = tmp_path / "ownbox" / "installed.json"
+    path.parent.mkdir(parents=True)
+    path.write_text("{not valid json")
+
+    with pytest.raises(RuntimeError, match="installed.json"):
+        installations()

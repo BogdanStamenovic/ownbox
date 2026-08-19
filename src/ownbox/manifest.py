@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import difflib
 import platform
 import re
 from dataclasses import dataclass, field
@@ -14,6 +15,39 @@ class ManifestError(ValueError):
 
 
 SUPPORTED_PLATFORMS = {"linux", "darwin", "windows"}
+
+TOP_LEVEL_KEYS = {
+    "schema",
+    "name",
+    "description",
+    "install",
+    "commands",
+    "command",
+    "tags",
+    "homepage",
+    # Present when parsing the local cache index written by to_dict(), where
+    # each tool entry carries its own "repo" alongside the manifest fields.
+    "repo",
+}
+
+INSTALL_KEYS = {"setup", "update", "remove", "platforms"}
+
+
+def check_unknown_keys(data: dict[str, Any], allowed: set[str], label: str) -> None:
+    unknown = sorted(set(data) - allowed)
+    if not unknown:
+        return
+    parts = []
+    for key in unknown:
+        suggestion = difflib.get_close_matches(key, allowed, n=1)
+        if suggestion:
+            parts.append(f"{key!r} (did you mean {suggestion[0]!r}?)")
+        else:
+            parts.append(repr(key))
+    raise ManifestError(
+        f"{label} has unknown key(s): {', '.join(parts)}; "
+        f"expected one of: {', '.join(sorted(allowed))}"
+    )
 
 
 def current_platform() -> str:
@@ -61,6 +95,7 @@ class Manifest:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any], repo: str = "") -> Manifest:
+        check_unknown_keys(data, TOP_LEVEL_KEYS, "manifest")
         schema = data.get("schema", 1)
         if schema != 1:
             raise ManifestError(f"unsupported schema {schema!r}; expected 1")
@@ -74,6 +109,7 @@ class Manifest:
         install = data.get("install") or {}
         if not isinstance(install, dict):
             raise ManifestError("install must be an object")
+        check_unknown_keys(install, INSTALL_KEYS, "install")
         lifecycle: dict[str, list[str]] = {}
         for field_name in ("setup", "update", "remove"):
             raw_value = install.get(field_name) or []
@@ -118,9 +154,18 @@ class Manifest:
                 commands[launcher_name] = value.strip()
         if command is not None and (not isinstance(command, str) or not command.strip()):
             raise ManifestError("command must be a non-empty shell command or platform mapping")
-        for label, values in (("tags", tags), ("install.platforms", platforms)):
-            if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
-                raise ManifestError(f"{label} must be a list of strings")
+        if not isinstance(tags, list) or not all(isinstance(v, str) for v in tags):
+            raise ManifestError("tags must be a list of strings")
+        if not isinstance(platforms, list) or not all(isinstance(v, str) for v in platforms):
+            raise ManifestError("install.platforms must be a list of strings")
+        normalized_platforms = [value.casefold() for value in platforms]
+        invalid_platforms = sorted(set(normalized_platforms) - SUPPORTED_PLATFORMS)
+        if invalid_platforms:
+            raise ManifestError(
+                f"install.platforms has unsupported value(s): {', '.join(invalid_platforms)}; "
+                f"expected one of: {', '.join(sorted(SUPPORTED_PLATFORMS))}"
+            )
+        platforms = normalized_platforms
 
         return cls(
             schema=1,

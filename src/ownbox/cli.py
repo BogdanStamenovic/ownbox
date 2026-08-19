@@ -103,6 +103,45 @@ def confirm_setup(tool: Manifest, assume_yes: bool) -> bool:
     return confirm_commands(tool.name, "setup", tool.setup, assume_yes)
 
 
+def print_manifest_details(tool: Manifest) -> None:
+    if tool.tags:
+        print(f"Tags: {', '.join(tool.tags)}")
+    if tool.platforms:
+        print(f"Platforms: {', '.join(tool.platforms)}")
+    for label, commands in (
+        ("Setup", tool.setup),
+        ("Update", tool.update),
+        ("Remove", tool.remove),
+    ):
+        if commands:
+            print(f"{label}:")
+            for command in commands:
+                print(f"  $ {command}")
+    if tool.command:
+        print(f"Entry command: {tool.command}")
+    if tool.commands:
+        print("Commands:")
+        for launcher_name, command in tool.commands.items():
+            print(f"  {launcher_name}: {command}")
+
+
+def parse_yes_flag(arguments: list[str], usage: str) -> bool:
+    if not arguments:
+        return False
+    if arguments in (["-y"], ["--yes"]):
+        return True
+    raise RuntimeError(usage)
+
+
+def error_message(exc: BaseException) -> str:
+    if isinstance(exc, KeyError):
+        return f"tool not found: {exc.args[0]}; run 'ownbox search --refresh'"
+    if isinstance(exc, FileNotFoundError):
+        missing = exc.filename or "a required program"
+        return f"{missing} is required but was not found on PATH; run 'ownbox doctor'"
+    return str(exc)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="ownbox", description="Your personal GitHub tool shelf")
     parser.add_argument("--version", action="version", version=f"ownbox {__version__}")
@@ -194,28 +233,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "info":
             tool = get_catalog().get(args.name)
             print(f"{tool.name} — {tool.description}\nRepository: https://github.com/{tool.repo}")
-            if tool.tags:
-                print(f"Tags: {', '.join(tool.tags)}")
-            if tool.platforms:
-                print(f"Platforms: {', '.join(tool.platforms)}")
-            if tool.setup:
-                print("Setup:")
-                for command in tool.setup:
-                    print(f"  $ {command}")
-            if tool.update:
-                print("Update:")
-                for command in tool.update:
-                    print(f"  $ {command}")
-            if tool.remove:
-                print("Remove:")
-                for command in tool.remove:
-                    print(f"  $ {command}")
-            if tool.command:
-                print(f"Entry command: {tool.command}")
-            if tool.commands:
-                print("Commands:")
-                for name, command in tool.commands.items():
-                    print(f"  {name}: {command}")
+            print_manifest_details(tool)
         elif args.command in {"install", "add"}:
             tool = get_catalog().get(args.name)
             if not confirm_setup(tool, args.yes):
@@ -243,7 +261,9 @@ def main(argv: list[str] | None = None) -> int:
             if not state:
                 print("No tools installed yet.")
             for name, item in sorted(state.items()):
-                print(f"{name:<24} {item['path']}")
+                revision = (item.get("revision") or "")[:7]
+                flag = "  (incomplete)" if item.get("state") == "incomplete" else ""
+                print(f"{name:<24} {revision:<8} {item['path']}{flag}")
         elif args.command in {"update", "upgrade"}:
             target = update(
                 args.name,
@@ -295,13 +315,10 @@ def main(argv: list[str] | None = None) -> int:
         ManifestError,
         RuntimeError,
         KeyError,
+        OSError,
         subprocess.CalledProcessError,
     ) as exc:
-        if isinstance(exc, KeyError):
-            message = f"tool not found: {exc.args[0]}; run 'ownbox search --refresh'"
-        else:
-            message = str(exc)
-        print(f"error: {message}", file=sys.stderr)
+        print(f"error: {error_message(exc)}", file=sys.stderr)
         return 1
 
 
@@ -349,9 +366,7 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
         target = Path(item["path"])
         action = arguments[0] if arguments else None
         if action == "update":
-            assume_yes = arguments[1:] in (["-y"], ["--yes"])
-            if arguments[1:] and not assume_yes:
-                raise RuntimeError("usage: <app> update [--yes]")
+            assume_yes = parse_yes_flag(arguments[1:], "usage: <app> update [--yes]")
             updated = update(
                 installed_name,
                 approve_commands=lambda commands: confirm_commands(
@@ -361,9 +376,7 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             print(f"Updated {installed_name} at {updated}")
             return 0
         if action in {"uninstall", "remove"}:
-            assume_yes = arguments[1:] in (["-y"], ["--yes"])
-            if arguments[1:] and not assume_yes:
-                raise RuntimeError(f"usage: <app> {action} [--yes]")
+            assume_yes = parse_yes_flag(arguments[1:], f"usage: <app> {action} [--yes]")
             removed = uninstall(
                 installed_name,
                 approve_commands=lambda commands: confirm_commands(
@@ -380,6 +393,12 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             print(f"{installed_name} — {manifest.description}")
             print(f"Repository: https://github.com/{item['repo']}")
             print(f"Installed: {target}")
+            revision = item.get("revision")
+            if revision:
+                print(f"Revision: {revision[:12]}")
+            if item.get("state") == "incomplete":
+                print("State: incomplete (setup did not finish)")
+            print_manifest_details(manifest)
             return 0
         command = manifest.command_for(name)
         if not command:
@@ -394,8 +413,14 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
         return subprocess.run(
             command, cwd=Path.cwd(), env=environment, shell=True, check=False
         ).returncode
-    except (ManifestError, RuntimeError, KeyError, subprocess.CalledProcessError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (
+        ManifestError,
+        RuntimeError,
+        KeyError,
+        OSError,
+        subprocess.CalledProcessError,
+    ) as exc:
+        print(f"error: {error_message(exc)}", file=sys.stderr)
         return 1
 
 

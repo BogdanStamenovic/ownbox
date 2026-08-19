@@ -193,3 +193,31 @@ On Windows, tools and `.cmd` launchers default to `%LOCALAPPDATA%\ownbox`, the c
 `%LOCALAPPDATA%\ownbox\bin` to `PATH`, or set `OWNBOX_BIN_DIR` to a directory already on `PATH`.
 
 Run `ownbox doctor` if authentication or dependencies are not working.
+
+## Troubleshooting
+
+Run `ownbox doctor` first. It reports whether `git` and `gh` are on `PATH`, whether the
+launcher directory is on `PATH`, and whether a GitHub login was found.
+
+**GitHub authentication failures** ("no GitHub login found; run 'gh auth login' or set
+GH_TOKEN"): Ownbox looks for a `GH_TOKEN` or `GITHUB_TOKEN` environment variable first,
+then falls back to `gh auth token`. Run `gh auth login`, or export `GH_TOKEN`/`GITHUB_TOKEN`
+with a personal access token, then retry.
+
+**GitHub API rate limits**: unauthenticated requests to the GitHub API are limited to 60
+requests per hour; an authenticated `gh` login or token raises that substantially. If
+`ownbox sync` or `ownbox search --refresh` reports a GitHub API error, authenticate as
+above and try again once the rate limit window resets.
+
+**Other GitHub API errors**: Ownbox surfaces the GitHub API's own error message (for
+example, an unknown owner or a network failure reaching `api.github.com`). Re-run
+`ownbox doctor` to confirm connectivity and login state.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for how to set up a development environment, run
+tests, and the manifest conventions to follow.
+
+## License
+
+Ownbox is released under the [MIT License](LICENSE).

@@ -4,12 +4,41 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .manifest import Manifest, current_platform
+
+# Network-bound git plumbing (clone/fetch/merge/rev-parse/show) gets its own budget,
+# separate from arbitrary tool-authored setup/update/remove shell commands, which may
+# legitimately run longer (e.g. compiling something).
+CLONE_TIMEOUT = int(os.environ.get("OWNBOX_CLONE_TIMEOUT", "600"))
+COMMAND_TIMEOUT = int(os.environ.get("OWNBOX_COMMAND_TIMEOUT", "1800"))
+
+
+def _run(command, *, timeout: int, check: bool = False, **kwargs):
+    try:
+        return subprocess.run(command, timeout=timeout, check=check, **kwargs)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(f"command timed out after {timeout}s: {command}") from exc
+
+
+def _atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(content)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def data_home() -> Path:
@@ -58,13 +87,12 @@ class Catalog:
 
     def save(self) -> None:
         path = cache_home() / "catalog.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "owner": self.owner,
             "synced_at": self.synced_at,
             "tools": [tool.to_dict() for tool in self.tools],
         }
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        _atomic_write(path, json.dumps(payload, indent=2) + "\n")
 
     def find(self, query: str) -> list[Manifest]:
         terms = query.casefold().split()
@@ -94,13 +122,15 @@ def installations() -> dict[str, dict]:
     path = data_home() / "installed.json"
     if not path.exists():
         return {}
-    return json.loads(path.read_text(encoding="utf-8"))
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"installed.json is corrupt or truncated: {path}") from exc
 
 
 def save_installations(state: dict[str, dict]) -> None:
     path = data_home() / "installed.json"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, indent=2) + "\n", encoding="utf-8")
+    _atomic_write(path, json.dumps(state, indent=2) + "\n")
 
 
 def launcher_path(name: str) -> Path:
@@ -167,7 +197,26 @@ def resolve_installation(state: dict[str, dict], name: str) -> tuple[str, dict]:
     return matches[0]
 
 
-def install(tool: Manifest, destination: Path | None = None) -> Path:
+def git_revision(target: Path) -> str | None:
+    try:
+        result = _run(
+            ["git", "-C", str(target), "rev-parse", "HEAD"],
+            timeout=CLONE_TIMEOUT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    revision = result.stdout.strip()
+    return revision or None
+
+
+def install(
+    tool: Manifest,
+    destination: Path | None = None,
+    approve_commands: Callable[[tuple[str, ...]], bool] | None = None,
+) -> Path:
     platform_name = current_platform()
     if tool.platforms and platform_name not in [item.casefold() for item in tool.platforms]:
         raise RuntimeError(f"{tool.name} does not support {platform_name}")
@@ -184,25 +233,39 @@ def install(tool: Manifest, destination: Path | None = None) -> Path:
     target = (destination or data_home() / "tools" / tool.name).expanduser().resolve()
     if target.exists():
         raise RuntimeError(f"destination already exists: {target}")
+    if tool.setup and approve_commands is not None and not approve_commands(tool.setup):
+        raise RuntimeError("setup commands were not approved")
     target.parent.mkdir(parents=True, exist_ok=True)
     clone_url = f"https://github.com/{tool.repo}.git"
     if shutil.which("gh"):
         clone = ["gh", "repo", "clone", tool.repo, str(target)]
     else:
         clone = ["git", "clone", clone_url, str(target)]
-    subprocess.run(clone, check=True)
-    try:
-        for command in tool.setup:
-            subprocess.run(command, cwd=target, shell=True, check=True)
-    except subprocess.CalledProcessError:
-        raise RuntimeError(f"setup failed; checkout kept at {target}") from None
-    launchers = create_launchers(tool)
+    _run(clone, timeout=CLONE_TIMEOUT, check=True)
+
+    # Record the checkout before running setup so a failed setup still leaves a
+    # tracked (and therefore uninstallable) entry instead of an orphaned checkout.
     state[tool.name] = {
         "repo": tool.repo,
         "path": str(target),
-        "launchers": launchers,
         "installed_at": datetime.now(timezone.utc).isoformat(),
+        "revision": git_revision(target),
+        "state": "incomplete",
     }
+    save_installations(state)
+
+    try:
+        for command in tool.setup:
+            _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
+    except subprocess.CalledProcessError:
+        raise RuntimeError(
+            f"setup failed; checkout kept at {target} "
+            f"(run 'ownbox uninstall {tool.name}' to remove it)"
+        ) from None
+
+    launchers = create_launchers(tool)
+    state[tool.name]["launchers"] = launchers
+    state[tool.name]["state"] = "complete"
     save_installations(state)
     return target
 
@@ -241,7 +304,7 @@ def uninstall(
             if approve_commands is not None and not approve_commands(manifest.remove):
                 raise RuntimeError("remove commands were not approved")
             for command in manifest.remove:
-                subprocess.run(command, cwd=target, shell=True, check=True)
+                _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
 
     for launcher in launchers.values():
         if launcher.exists():
@@ -254,6 +317,28 @@ def uninstall(
     return target
 
 
+def _read_incoming_manifest(target: Path, repo: str) -> Manifest | None:
+    """Read ownbox.yaml as it will look after a fast-forward, without touching the tree.
+
+    Prefers the fetched revision (FETCH_HEAD); falls back to whatever manifest is
+    already checked out; falls back to None (no lifecycle commands) if neither exists.
+    """
+    try:
+        result = _run(
+            ["git", "-C", str(target), "show", "FETCH_HEAD:ownbox.yaml"],
+            timeout=CLONE_TIMEOUT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.CalledProcessError:
+        manifest_path = target / "ownbox.yaml"
+        if manifest_path.exists():
+            return Manifest.from_path(manifest_path, repo)
+        return None
+    return Manifest.from_text(result.stdout, repo)
+
+
 def update(
     name: str,
     approve_commands: Callable[[tuple[str, ...]], bool] | None = None,
@@ -261,18 +346,32 @@ def update(
     state = installations()
     installed_name, item = resolve_installation(state, name)
     target = Path(item["path"])
-    subprocess.run(["git", "-C", str(target), "pull", "--ff-only"], check=True)
-    manifest_path = target / "ownbox.yaml"
-    manifest = None
-    if manifest_path.exists():
-        manifest = Manifest.from_path(manifest_path, item["repo"])
+
+    try:
+        _run(["git", "-C", str(target), "fetch"], timeout=CLONE_TIMEOUT, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"failed to fetch updates for {installed_name}") from exc
+
+    manifest = _read_incoming_manifest(target, item["repo"])
+    commands: tuple[str, ...] = ()
+    if manifest is not None:
         commands = manifest.update or manifest.setup
-        if commands and approve_commands is not None and not approve_commands(commands):
-            raise RuntimeError(
-                "update commands were not approved; checkout was pulled successfully"
-            )
-        for command in commands:
-            subprocess.run(command, cwd=target, shell=True, check=True)
+
+    if commands and approve_commands is not None and not approve_commands(commands):
+        raise RuntimeError("update commands were not approved; checkout was left unchanged")
+
+    try:
+        _run(
+            ["git", "-C", str(target), "merge", "--ff-only", "FETCH_HEAD"],
+            timeout=CLONE_TIMEOUT,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"failed to fast-forward {installed_name}") from exc
+
+    for command in commands:
+        _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
+
     if manifest is not None:
         old_launchers = installed_launcher_paths(installed_name, item)
         new_names = launcher_names(manifest)
@@ -297,6 +396,7 @@ def update(
         item.pop("launcher", None)
     else:
         create_launcher(installed_name)
+    item["revision"] = git_revision(target)
     item["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_installations(state)
     return target

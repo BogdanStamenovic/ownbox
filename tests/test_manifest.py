@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 
 from ownbox.manifest import Manifest, ManifestError
@@ -159,3 +161,38 @@ commands:
 def test_rejects_invalid_platform_mappings(field, message):
     with pytest.raises(ManifestError, match=message):
         Manifest.from_text(f"name: demo\ndescription: Demo\n{field}\n")
+
+
+def test_rejects_unsupported_install_platform_value():
+    with pytest.raises(ManifestError, match="unsupported value"):
+        Manifest.from_text(
+            "name: demo\ndescription: Demo\ninstall:\n  platforms: [linus]\n"
+        )
+
+
+def test_accepts_and_casefolds_valid_install_platform_value():
+    manifest = Manifest.from_text(
+        "name: demo\ndescription: Demo\ninstall:\n  platforms: [Linux, DARWIN]\n"
+    )
+    assert manifest.platforms == ("linux", "darwin")
+
+
+def test_rejects_unknown_top_level_key():
+    with pytest.raises(ManifestError, match="unknown key"):
+        Manifest.from_text(
+            "name: demo\ndescription: Demo\nintall:\n  setup: [echo hi]\n"
+        )
+
+
+def test_rejects_unknown_install_key():
+    with pytest.raises(ManifestError, match="unknown key"):
+        Manifest.from_text(
+            "name: demo\ndescription: Demo\ninstall:\n  setpu: [echo hi]\n"
+        )
+
+
+def test_own_ownbox_yaml_still_parses():
+    path = Path(__file__).resolve().parent.parent / "ownbox.yaml"
+    manifest = Manifest.from_path(path, "BogdanStamenovic/ownbox")
+    assert manifest.name == "ownbox-dev"
+    assert manifest.platforms == ("linux", "darwin", "windows")
