@@ -53,6 +53,13 @@ printcam photo --output latest.jpg
 printcam update
 printcam info
 ownbox uninstall printcam
+
+# Update every installed tool in one pass
+ownbox update-all
+
+# Go back to the previous revision (or further back with a step count)
+ownbox rollback printcam
+ownbox rollback printcam 2
 ```
 
 The first sync defaults to the GitHub account authenticated by `gh`. To use an organization
@@ -130,13 +137,14 @@ but normal arguments pass through to the configured command:
 printcam photo --output a.jpg  ->  .venv/bin/python -m printcam photo --output a.jpg
 printcam --help                ->  .venv/bin/python -m printcam --help
 printcam update                ->  Ownbox pulls and runs its update commands (or setup fallback)
+printcam rollback              ->  Ownbox reverts the checkout to a previous revision
 printcam info                  ->  Ownbox shows installation information
 printcam where                 ->  Ownbox prints the checkout directory
 printcam uninstall             ->  Ownbox removes the launcher and checkout
 printcam remove                ->  Alias for uninstall, including app-native cleanup
 ```
 
-Only `update`, `uninstall`, `remove`, `info`, and `where` are reserved. All other arguments pass through untouched.
+Only `update`, `rollback`, `uninstall`, `remove`, `info`, and `where` are reserved. All other arguments pass through untouched.
 If the underlying app itself needs one of those words, use `--` to bypass routing—for example,
 `printcam -- update` passes `-- update` to PrintCAM.
 
@@ -180,6 +188,44 @@ registry is needed.
 
 Lifecycle commands are code from the repository. Ownbox displays them and asks for confirmation
 before running them. Use `--yes` only for repositories you trust.
+
+## Updating and rolling back
+
+`ownbox update NAME` fetches, shows you the update commands from the incoming revision,
+and only fast-forwards the checkout once you approve them. Declining leaves the checkout
+exactly as it was.
+
+`ownbox update-all` runs that over every installed tool. A tool that fails does not stop
+the rest; incomplete installations are skipped, and the command exits non-zero if anything
+failed.
+
+Ownbox records the commit each tool is on, so `ownbox list` shows the short revision and
+`NAME info` shows the full one along with the revisions available to roll back to.
+
+`ownbox rollback NAME [STEPS]` reverts to a previously installed revision, defaulting to
+one step back. It re-runs that revision's update commands (with the same approval prompt)
+so the checkout is rebuilt to match. Rollback is a `git reset --hard`, so it refuses to run
+when tracked files have uncommitted changes unless you pass `--force`; untracked build
+artifacts are left alone and do not block it.
+
+Rolling back consumes history: after `ownbox rollback printcam 2`, those two entries are
+gone and moving forward again is just `ownbox update printcam`.
+
+## Settings
+
+```bash
+ownbox settings                  # show every setting and its current value
+ownbox set keep-history 10       # keep 10 prior revisions per tool
+```
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `keep-history` | `5` | How many prior revisions per tool stay available to `ownbox rollback`. `0` disables history. |
+
+Settings are stored alongside the catalog owner in `config.yaml` in the config directory
+described below. `keep-history` caps how many revisions Ownbox *remembers* as rollback
+targets, not how much disk is used—the checkout is an ordinary git clone, so every revision
+is present regardless.
 
 ## Where files go
 

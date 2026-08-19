@@ -4,13 +4,19 @@ import json
 import os
 import shutil
 import subprocess
-import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .manifest import Manifest, current_platform
+from .settings import _atomic_write, config_home, keep_history
+
+# Re-exported for backward compatibility: cli.py and tests import config_home
+# and _atomic_write from ownbox.store, but the implementations now live in
+# settings.py (which store.py depends on for keep_history()) to avoid a
+# store <-> settings import cycle.
+__all__ = ["_atomic_write", "config_home"]
 
 # Network-bound git plumbing (clone/fetch/merge/rev-parse/show) gets its own budget,
 # separate from arbitrary tool-authored setup/update/remove shell commands, which may
@@ -26,21 +32,6 @@ def _run(command, *, timeout: int, check: bool = False, **kwargs):
         raise RuntimeError(f"command timed out after {timeout}s: {command}") from exc
 
 
-def _atomic_write(path: Path, content: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.", suffix=".tmp")
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            handle.write(content)
-        os.replace(tmp_name, path)
-    except BaseException:
-        try:
-            os.unlink(tmp_name)
-        except OSError:
-            pass
-        raise
-
-
 def data_home() -> Path:
     if current_platform() == "windows":
         return Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData/Local")) / "ownbox"
@@ -51,12 +42,6 @@ def cache_home() -> Path:
     if current_platform() == "windows":
         return data_home() / "cache"
     return Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "ownbox"
-
-
-def config_home() -> Path:
-    if current_platform() == "windows":
-        return Path(os.environ.get("APPDATA", Path.home() / "AppData/Roaming")) / "ownbox"
-    return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "ownbox"
 
 
 def bin_home() -> Path:
@@ -317,15 +302,16 @@ def uninstall(
     return target
 
 
-def _read_incoming_manifest(target: Path, repo: str) -> Manifest | None:
-    """Read ownbox.yaml as it will look after a fast-forward, without touching the tree.
+def _read_manifest_at_ref(target: Path, ref: str, repo: str) -> Manifest | None:
+    """Read ownbox.yaml as it exists at `ref`, without touching the working tree.
 
-    Prefers the fetched revision (FETCH_HEAD); falls back to whatever manifest is
-    already checked out; falls back to None (no lifecycle commands) if neither exists.
+    Prefers the manifest at `ref` (e.g. "FETCH_HEAD" or a commit sha); falls back to
+    whatever manifest is already checked out; falls back to None (no lifecycle
+    commands) if neither exists.
     """
     try:
         result = _run(
-            ["git", "-C", str(target), "show", "FETCH_HEAD:ownbox.yaml"],
+            ["git", "-C", str(target), "show", f"{ref}:ownbox.yaml"],
             timeout=CLONE_TIMEOUT,
             check=True,
             capture_output=True,
@@ -339,6 +325,63 @@ def _read_incoming_manifest(target: Path, repo: str) -> Manifest | None:
     return Manifest.from_text(result.stdout, repo)
 
 
+def _read_incoming_manifest(target: Path, repo: str) -> Manifest | None:
+    """Read ownbox.yaml as it will look after a fast-forward, without touching the tree."""
+    return _read_manifest_at_ref(target, "FETCH_HEAD", repo)
+
+
+def _refresh_launchers(
+    installed_name: str,
+    item: dict,
+    state: dict[str, dict],
+    manifest: Manifest | None,
+) -> None:
+    """Recreate launchers for `item` from `manifest`, retiring any that are no longer named.
+
+    Shared by update() and rollback(): both land on a new manifest revision and need
+    the same "diff old launcher names against new ones" dance.
+    """
+    if manifest is None:
+        create_launcher(installed_name)
+        return
+    old_launchers = installed_launcher_paths(installed_name, item)
+    new_names = launcher_names(manifest)
+    occupied = {
+        alias.casefold()
+        for other_name, other_item in state.items()
+        if other_name != installed_name
+        for alias in installed_launcher_paths(other_name, other_item)
+    }
+    for launcher_name in new_names:
+        if launcher_name.casefold() in occupied:
+            raise RuntimeError(f"command is already provided by an installed tool: {launcher_name}")
+        check_launcher(launcher_name)
+    retained = {launcher_name.casefold() for launcher_name in new_names}
+    for launcher_name, launcher in old_launchers.items():
+        if launcher_name.casefold() not in retained and launcher.exists():
+            check_launcher(launcher_name)
+            launcher.unlink()
+    item["launchers"] = create_launchers(manifest)
+    item.pop("launcher", None)
+
+
+def record_history(item: dict, revision: str | None) -> None:
+    """Prepend `revision` onto item["history"], trimmed to the configured keep-history length.
+
+    No-op if `revision` is None. If keep-history is 0, any existing history list is
+    dropped instead so it doesn't linger unused.
+    """
+    keep = keep_history()
+    if keep == 0:
+        item.pop("history", None)
+        return
+    if revision is None:
+        return
+    entry = {"revision": revision, "recorded_at": datetime.now(timezone.utc).isoformat()}
+    history = item.get("history") or []
+    item["history"] = [entry, *history][:keep]
+
+
 def update(
     name: str,
     approve_commands: Callable[[tuple[str, ...]], bool] | None = None,
@@ -346,6 +389,7 @@ def update(
     state = installations()
     installed_name, item = resolve_installation(state, name)
     target = Path(item["path"])
+    old_revision = item.get("revision")
 
     try:
         _run(["git", "-C", str(target), "fetch"], timeout=CLONE_TIMEOUT, check=True)
@@ -372,31 +416,86 @@ def update(
     for command in commands:
         _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
 
-    if manifest is not None:
-        old_launchers = installed_launcher_paths(installed_name, item)
-        new_names = launcher_names(manifest)
-        occupied = {
-            alias.casefold()
-            for other_name, other_item in state.items()
-            if other_name != installed_name
-            for alias in installed_launcher_paths(other_name, other_item)
-        }
-        for launcher_name in new_names:
-            if launcher_name.casefold() in occupied:
-                raise RuntimeError(
-                    f"command is already provided by an installed tool: {launcher_name}"
-                )
-            check_launcher(launcher_name)
-        retained = {launcher_name.casefold() for launcher_name in new_names}
-        for launcher_name, launcher in old_launchers.items():
-            if launcher_name.casefold() not in retained and launcher.exists():
-                check_launcher(launcher_name)
-                launcher.unlink()
-        item["launchers"] = create_launchers(manifest)
-        item.pop("launcher", None)
-    else:
-        create_launcher(installed_name)
-    item["revision"] = git_revision(target)
+    _refresh_launchers(installed_name, item, state, manifest)
+    new_revision = git_revision(target)
+    # An up-to-date update is a no-op; recording it would fill the rollback
+    # history with duplicates of the current revision and burn every slot.
+    if new_revision != old_revision:
+        record_history(item, old_revision)
+    item["revision"] = new_revision
     item["updated_at"] = datetime.now(timezone.utc).isoformat()
     save_installations(state)
     return target
+
+
+def rollback(
+    name: str,
+    steps: int = 1,
+    approve_commands: Callable[[tuple[str, ...]], bool] | None = None,
+    force: bool = False,
+) -> tuple[Path, str]:
+    if steps < 1:
+        raise RuntimeError(f"steps must be at least 1, got {steps}")
+
+    state = installations()
+    installed_name, item = resolve_installation(state, name)
+    target = Path(item["path"])
+
+    history = item.get("history") or []
+    if not history:
+        raise RuntimeError(
+            f"no rollback history for {installed_name}; keep-history is {keep_history()}"
+        )
+    if steps > len(history):
+        raise RuntimeError(
+            f"only {len(history)} rollback step(s) available for {installed_name}, "
+            f"requested {steps}"
+        )
+
+    if not force:
+        try:
+            status = _run(
+                # Untracked files are excluded deliberately: 'git reset --hard' leaves
+                # them alone, and setup/update commands routinely leave build artifacts
+                # behind, which would otherwise make rollback permanently unavailable.
+                ["git", "-C", str(target), "status", "--porcelain", "--untracked-files=no"],
+                timeout=CLONE_TIMEOUT,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+        except subprocess.CalledProcessError as exc:
+            raise RuntimeError(f"failed to check working tree status for {installed_name}") from exc
+        if status.stdout.strip():
+            raise RuntimeError(
+                f"{installed_name} has uncommitted changes to tracked files; rollback "
+                "would discard them with 'git reset --hard' (use --force to override)"
+            )
+
+    target_revision = history[steps - 1]["revision"]
+    manifest = _read_manifest_at_ref(target, target_revision, item["repo"])
+    commands: tuple[str, ...] = ()
+    if manifest is not None:
+        commands = manifest.update or manifest.setup
+
+    if commands and approve_commands is not None and not approve_commands(commands):
+        raise RuntimeError("rollback commands were not approved; checkout was left unchanged")
+
+    try:
+        _run(
+            ["git", "-C", str(target), "reset", "--hard", target_revision],
+            timeout=CLONE_TIMEOUT,
+            check=True,
+        )
+    except subprocess.CalledProcessError as exc:
+        raise RuntimeError(f"failed to reset {installed_name} to {target_revision}") from exc
+
+    for command in commands:
+        _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
+
+    _refresh_launchers(installed_name, item, state, manifest)
+    item["history"] = history[steps:]
+    item["revision"] = target_revision
+    item["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+    save_installations(state)
+    return target, target_revision

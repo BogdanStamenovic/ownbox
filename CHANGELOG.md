@@ -6,6 +6,27 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-19
+
+### Added
+
+- `ownbox update-all` updates every installed tool in one pass. Failures are
+  isolated per tool, incomplete installations are skipped, and the command
+  exits non-zero if anything failed.
+- `ownbox rollback NAME [STEPS]` reverts a tool to a previously installed
+  revision, re-running that revision's update commands under the usual
+  approval prompt. Also available as `NAME rollback`, a new reserved word.
+- `ownbox set KEY VALUE` and `ownbox settings` for configuration, with the
+  first setting: `keep-history` (default 5, `0` disables), controlling how
+  many prior revisions per tool stay available to roll back to.
+- Update history is recorded per tool and surfaced in `NAME info` as the
+  available rollback targets.
+
+### Fixed
+
+- `save_owner()` no longer rewrites the whole config file; config writes now
+  merge, so the catalog owner and settings can coexist.
+
 ### Added
 
 - Installs and updates now record the checked-out commit SHA. `ownbox list`

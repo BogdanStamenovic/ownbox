@@ -14,6 +14,7 @@ import yaml
 from . import __version__
 from .github import GitHubClient, GitHubError
 from .manifest import Manifest, ManifestError, current_platform
+from .settings import SETTINGS, all_settings, set_setting
 from .store import (
     Catalog,
     bin_home,
@@ -23,6 +24,7 @@ from .store import (
     launcher_path,
     new_catalog,
     resolve_installation,
+    rollback,
     uninstall,
     update,
 )
@@ -39,9 +41,13 @@ TOP_LEVEL_COMMANDS = {
     "ls",
     "update",
     "upgrade",
+    "update-all",
+    "rollback",
     "run",
     "init",
     "doctor",
+    "set",
+    "settings",
 }
 
 
@@ -133,6 +139,29 @@ def parse_yes_flag(arguments: list[str], usage: str) -> bool:
     raise RuntimeError(usage)
 
 
+def parse_rollback_args(arguments: list[str]) -> tuple[int, bool, bool]:
+    """Parse `[STEPS] [-y|--yes] [--force]` for `<tool> rollback`."""
+    usage = "usage: <app> rollback [STEPS] [--yes] [--force]"
+    steps = 1
+    assume_yes = False
+    force = False
+    saw_steps = False
+    for argument in arguments:
+        if argument in ("-y", "--yes"):
+            assume_yes = True
+        elif argument == "--force":
+            force = True
+        elif not saw_steps and not argument.startswith("-"):
+            try:
+                steps = int(argument)
+            except ValueError:
+                raise RuntimeError(usage) from None
+            saw_steps = True
+        else:
+            raise RuntimeError(usage)
+    return steps, assume_yes, force
+
+
 def error_message(exc: BaseException) -> str:
     if isinstance(exc, KeyError):
         return f"tool not found: {exc.args[0]}; run 'ownbox search --refresh'"
@@ -178,6 +207,27 @@ def build_parser() -> argparse.ArgumentParser:
     upgrade.add_argument("name")
     upgrade.add_argument("-y", "--yes", action="store_true", help="approve app update commands")
 
+    update_all = sub.add_parser("update-all", help="pull and update every installed tool")
+    update_all.add_argument(
+        "-y", "--yes", action="store_true", help="approve app update commands"
+    )
+
+    roll = sub.add_parser("rollback", help="revert an installed tool to a prior revision")
+    roll.add_argument("name")
+    roll.add_argument(
+        "steps", nargs="?", type=int, default=1, help="how many recorded revisions to go back"
+    )
+    roll.add_argument("-y", "--yes", action="store_true", help="approve rollback commands")
+    roll.add_argument(
+        "--force", action="store_true", help="discard local changes in the checkout"
+    )
+
+    set_cmd = sub.add_parser("set", help="change an ownbox setting")
+    set_cmd.add_argument("key")
+    set_cmd.add_argument("value")
+
+    sub.add_parser("settings", help="show all ownbox settings")
+
     run = sub.add_parser("run", help="run a named command from an installed tool")
     run.add_argument("name")
     run.add_argument("task")
@@ -216,6 +266,45 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("doctor", help="check local dependencies and GitHub login")
     return parser
+
+
+def run_update_all(assume_yes: bool) -> int:
+    state = installations()
+    if not state:
+        print("No tools installed yet.")
+        return 0
+    updated = skipped = failed = 0
+    for name in sorted(state):
+        item = state[name]
+        if item.get("state") == "incomplete":
+            skipped += 1
+            print(f"{name}: skipped (incomplete installation)")
+            continue
+        def approve(commands: tuple[str, ...], name: str = name) -> bool:
+            return confirm_commands(name, "update", commands, assume_yes)
+
+        try:
+            target = update(name, approve_commands=approve)
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
+            failed += 1
+            print(f"{name}: failed ({error_message(exc)})")
+            continue
+        updated += 1
+        print(f"{name}: updated at {target}")
+    print(f"update-all: {updated} updated, {skipped} skipped, {failed} failed")
+    return 1 if failed else 0
+
+
+def print_settings() -> None:
+    values = all_settings()
+    if not values:
+        print("No settings.")
+        return
+    width = max(len(key) for key in values)
+    for key in sorted(values):
+        help_text = SETTINGS[key].help if key in SETTINGS else None
+        suffix = f"  {help_text}" if help_text else ""
+        print(f"{key:<{width}}  {values[key]}{suffix}")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -272,6 +361,23 @@ def main(argv: list[str] | None = None) -> int:
                 ),
             )
             print(f"Updated {args.name} at {target}")
+        elif args.command == "update-all":
+            return run_update_all(args.yes)
+        elif args.command == "rollback":
+            target, revision = rollback(
+                args.name,
+                args.steps,
+                approve_commands=lambda commands: confirm_commands(
+                    args.name, "rollback", commands, args.yes
+                ),
+                force=args.force,
+            )
+            print(f"Rolled back {args.name} to {revision[:7]} at {target}")
+        elif args.command == "set":
+            value = set_setting(args.key, args.value)
+            print(f"Set {args.key} = {value}")
+        elif args.command == "settings":
+            print_settings()
         elif args.command == "run":
             return dispatch_tool(args.name, [args.task, *args.args])
         elif args.command == "init":
@@ -385,6 +491,21 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             )
             print(f"Uninstalled {installed_name}; removed checkout at {removed}")
             return 0
+        if action == "rollback":
+            steps, assume_yes, force = parse_rollback_args(arguments[1:])
+            rolled_back_target, rollback_revision = rollback(
+                installed_name,
+                steps,
+                approve_commands=lambda commands: confirm_commands(
+                    installed_name, "rollback", commands, assume_yes
+                ),
+                force=force,
+            )
+            print(
+                f"Rolled back {installed_name} to {rollback_revision[:7]} "
+                f"at {rolled_back_target}"
+            )
+            return 0
         if action == "where":
             print(target)
             return 0
@@ -396,6 +517,10 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
             revision = item.get("revision")
             if revision:
                 print(f"Revision: {revision[:12]}")
+            history = item.get("history") or []
+            if history:
+                shas = ", ".join(entry["revision"][:7] for entry in history)
+                print(f"Rollback targets: {len(history)} ({shas})")
             if item.get("state") == "incomplete":
                 print("State: incomplete (setup did not finish)")
             print_manifest_details(manifest)

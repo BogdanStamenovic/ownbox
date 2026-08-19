@@ -3,12 +3,15 @@ import subprocess
 import pytest
 
 from ownbox.manifest import Manifest
+from ownbox.settings import set_setting
 from ownbox.store import (
     COMMAND_TIMEOUT,
     Catalog,
     create_launcher,
     install,
     installations,
+    record_history,
+    rollback,
     save_installations,
     uninstall,
     update,
@@ -271,6 +274,7 @@ def test_update_prefers_native_update_commands_and_falls_back_to_setup(tmp_path,
     monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     checkout = tmp_path / "demo"
     checkout.mkdir()
     manifest_path = checkout / "ownbox.yaml"
@@ -316,6 +320,7 @@ def test_update_declining_leaves_checkout_completely_untouched(tmp_path, monkeyp
     monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     checkout = tmp_path / "demo"
     checkout.mkdir()
     (checkout / "ownbox.yaml").write_text(
@@ -349,6 +354,7 @@ def test_update_records_revision_after_fast_forward(tmp_path, monkeypatch):
     monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     checkout = tmp_path / "demo"
     checkout.mkdir()
     save_installations({"demo": {"path": str(checkout), "repo": "me/demo"}})
@@ -366,6 +372,7 @@ def test_update_refreshes_named_launchers(tmp_path, monkeypatch):
     monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
     checkout = tmp_path / "demo"
     checkout.mkdir()
     manifest_path = checkout / "ownbox.yaml"
@@ -401,6 +408,9 @@ def test_update_refreshes_named_launchers(tmp_path, monkeypatch):
 
 def test_windows_launcher_and_platform_directories(tmp_path, monkeypatch):
     monkeypatch.setattr("ownbox.store.current_platform", lambda: "windows")
+    # config_home()'s implementation lives in settings.py (it needs its own
+    # current_platform() to pick the APPDATA branch independently of store.py).
+    monkeypatch.setattr("ownbox.settings.current_platform", lambda: "windows")
     monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "local"))
     monkeypatch.setenv("APPDATA", str(tmp_path / "roaming"))
     monkeypatch.delenv("OWNBOX_BIN_DIR", raising=False)
@@ -480,3 +490,312 @@ def test_installations_raises_clear_error_on_corrupt_json(tmp_path, monkeypatch)
 
     with pytest.raises(RuntimeError, match="installed.json"):
         installations()
+
+
+# ---------------------------------------------------------------------------
+# History recording (record_history / update) and rollback
+# ---------------------------------------------------------------------------
+
+
+def configure_platforms(monkeypatch, tmp_path):
+    """Isolate both store's and settings' path helpers under tmp_path."""
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setattr("ownbox.settings.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+
+
+def test_record_history_trims_to_configured_keep_length(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    set_setting("keep-history", "2")
+
+    item: dict = {}
+    record_history(item, "r1")
+    record_history(item, "r2")
+    record_history(item, "r3")
+
+    assert [entry["revision"] for entry in item["history"]] == ["r3", "r2"]
+
+
+def test_record_history_noop_when_revision_is_none(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+
+    item: dict = {}
+    record_history(item, None)
+
+    assert "history" not in item
+
+
+def test_record_history_disabled_and_clears_stale_list_when_keep_history_zero(
+    tmp_path, monkeypatch
+):
+    configure_platforms(monkeypatch, tmp_path)
+    set_setting("keep-history", "0")
+
+    item = {"history": [{"revision": "stale", "recorded_at": "t"}]}
+    record_history(item, "new")
+
+    assert "history" not in item
+
+
+def test_update_records_previous_revision_into_history(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    save_installations(
+        {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "old-sha"}}
+    )
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", fake_git_run(checkout, revision="new-sha")
+    )
+
+    update("demo")
+
+    state = installations()
+    assert state["demo"]["revision"] == "new-sha"
+    assert [entry["revision"] for entry in state["demo"]["history"]] == ["old-sha"]
+
+
+def test_update_does_not_record_history_when_already_up_to_date(tmp_path, monkeypatch):
+    """A no-op update must not push a duplicate of the current revision onto history.
+
+    Otherwise repeated 'ownbox update-all' runs fill every rollback slot with the
+    revision the tool is already on, making 'rollback 1' a no-op.
+    """
+    configure_platforms(monkeypatch, tmp_path)
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    save_installations(
+        {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "same-sha"}}
+    )
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", fake_git_run(checkout, revision="same-sha")
+    )
+
+    update("demo")
+    update("demo")
+
+    state = installations()
+    assert state["demo"]["revision"] == "same-sha"
+    assert state["demo"].get("history", []) == []
+
+
+def test_update_does_not_record_history_on_declined_update(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    (checkout / "ownbox.yaml").write_text(
+        "name: demo\ndescription: Demo\ninstall:\n  update: [python update.py]\n"
+    )
+    save_installations(
+        {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "old-sha"}}
+    )
+
+    def fake_run(command, **kwargs):
+        if isinstance(command, list) and "show" in command:
+            raise subprocess.CalledProcessError(1, command)
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="not approved"):
+        update("demo", approve_commands=lambda commands: False)
+
+    state = installations()
+    assert state["demo"]["revision"] == "old-sha"
+    assert "history" not in state["demo"]
+
+
+def _rollback_checkout(tmp_path, *, update_commands="[python update.py]"):
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    manifest_path = checkout / "ownbox.yaml"
+    manifest_path.write_text(
+        "name: demo\ndescription: Demo\ncommands:\n  demo: bin/demo\ninstall:\n"
+        f"  update: {update_commands}\n"
+    )
+    return checkout, manifest_path
+
+
+def test_rollback_reverts_to_prior_revision_and_reruns_lifecycle_commands(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout, manifest_path = _rollback_checkout(tmp_path)
+    save_installations(
+        {
+            "demo": {
+                "path": str(checkout),
+                "repo": "me/demo",
+                "revision": "new-sha",
+                "history": [
+                    {"revision": "old-sha", "recorded_at": "2024-01-01T00:00:00+00:00"},
+                    {"revision": "older-sha", "recorded_at": "2023-01-01T00:00:00+00:00"},
+                ],
+                "launchers": {"demo": str(create_launcher("demo"))},
+            }
+        }
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        if isinstance(command, list) and "status" in command:
+            return completed(command, stdout="")
+        if isinstance(command, list) and "show" in command:
+            return completed(command, stdout=manifest_path.read_text())
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+
+    target, revision = rollback(
+        "demo", approve_commands=lambda commands: commands == ("python update.py",)
+    )
+
+    assert target == checkout
+    assert revision == "old-sha"
+    reset_calls = [c for c, _ in calls if isinstance(c, list) and "reset" in c]
+    assert reset_calls == [["git", "-C", str(checkout), "reset", "--hard", "old-sha"]]
+    assert (
+        "python update.py",
+        {"cwd": checkout, "shell": True, "check": True, "timeout": COMMAND_TIMEOUT},
+    ) in calls
+
+    state = installations()
+    assert state["demo"]["revision"] == "old-sha"
+    assert state["demo"]["history"] == [
+        {"revision": "older-sha", "recorded_at": "2023-01-01T00:00:00+00:00"}
+    ]
+    assert "rolled_back_at" in state["demo"]
+    assert (tmp_path / "bin" / "demo").exists()
+
+
+def test_rollback_raises_when_no_history(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout, _ = _rollback_checkout(tmp_path)
+    save_installations({"demo": {"path": str(checkout), "repo": "me/demo", "revision": "new"}})
+    calls = []
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", lambda command, **kwargs: calls.append(command)
+    )
+
+    with pytest.raises(RuntimeError, match="no rollback history"):
+        rollback("demo")
+
+    assert calls == []
+
+
+def test_rollback_raises_when_steps_exceeds_available_history(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout, _ = _rollback_checkout(tmp_path)
+    save_installations(
+        {
+            "demo": {
+                "path": str(checkout),
+                "repo": "me/demo",
+                "revision": "new",
+                "history": [{"revision": "old", "recorded_at": "t"}],
+            }
+        }
+    )
+    calls = []
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run", lambda command, **kwargs: calls.append(command)
+    )
+
+    with pytest.raises(RuntimeError, match="only 1 rollback step"):
+        rollback("demo", steps=2)
+
+    assert calls == []
+
+
+def test_rollback_declined_leaves_checkout_untouched(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout, manifest_path = _rollback_checkout(tmp_path)
+    save_installations(
+        {
+            "demo": {
+                "path": str(checkout),
+                "repo": "me/demo",
+                "revision": "new",
+                "history": [{"revision": "old", "recorded_at": "t"}],
+            }
+        }
+    )
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if isinstance(command, list) and "status" in command:
+            return completed(command, stdout="")
+        if isinstance(command, list) and "show" in command:
+            return completed(command, stdout=manifest_path.read_text())
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="not approved"):
+        rollback("demo", approve_commands=lambda commands: False)
+
+    assert not any(isinstance(c, list) and "reset" in c for c in calls)
+    state = installations()
+    assert state["demo"]["revision"] == "new"
+    assert state["demo"]["history"] == [{"revision": "old", "recorded_at": "t"}]
+    assert "rolled_back_at" not in state["demo"]
+
+
+def test_rollback_refuses_dirty_working_tree_without_force(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout, manifest_path = _rollback_checkout(tmp_path)
+    save_installations(
+        {
+            "demo": {
+                "path": str(checkout),
+                "repo": "me/demo",
+                "revision": "new",
+                "history": [{"revision": "old", "recorded_at": "t"}],
+                "launchers": {"demo": str(create_launcher("demo"))},
+            }
+        }
+    )
+
+    issued: list = []
+
+    def fake_run(command, **kwargs):
+        issued.append(command)
+        if isinstance(command, list) and "status" in command:
+            return completed(command, stdout=" M some-file\n")
+        if isinstance(command, list) and "show" in command:
+            return completed(command, stdout=manifest_path.read_text())
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+
+    with pytest.raises(RuntimeError, match="uncommitted changes"):
+        rollback("demo")
+
+    # git reset --hard leaves untracked files alone, so the dirty check must ask
+    # git to ignore them; otherwise build artifacts block rollback forever.
+    status_commands = [
+        command for command in issued if isinstance(command, list) and "status" in command
+    ]
+    assert status_commands, "expected a git status call"
+    assert all("--untracked-files=no" in command for command in status_commands)
+
+    assert installations()["demo"]["revision"] == "new"
+
+    # force=True skips the dirty-tree check entirely and proceeds.
+    calls = []
+
+    def fake_run_force(command, **kwargs):
+        calls.append(command)
+        if isinstance(command, list) and "show" in command:
+            return completed(command, stdout=manifest_path.read_text())
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run_force)
+
+    target, revision = rollback("demo", force=True)
+
+    assert revision == "old"
+    assert target == checkout
+    assert not any(isinstance(c, list) and "status" in c for c in calls)
