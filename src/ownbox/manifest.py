@@ -23,6 +23,7 @@ TOP_LEVEL_KEYS = {
     "install",
     "commands",
     "command",
+    "skill",
     "tags",
     "homepage",
     # Present when parsing the local cache index written by to_dict(), where
@@ -64,6 +65,34 @@ def platform_value(value: Any, label: str) -> Any:
     return value.get(current_platform(), value.get("default"))
 
 
+def normalize_skills(raw: Any) -> tuple[str, ...]:
+    """Validate the `skill:` value and return checkout-relative skill paths.
+
+    Accepts a single string or a list of strings. Each is a path, relative to the
+    repository checkout, to a skill directory (holding SKILL.md) that Ownbox links
+    into the Claude Code skills directory. Absolute paths and any component that
+    escapes the checkout ('..') are rejected here so a manifest can never point the
+    installer at a file outside the cloned repository.
+    """
+    if raw is None:
+        return ()
+    values = [raw] if isinstance(raw, str) else raw
+    if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
+        raise ManifestError("skill must be a path string or a list of path strings")
+    result: list[str] = []
+    for item in values:
+        cleaned = item.strip()
+        if not cleaned:
+            raise ManifestError("skill paths must be non-empty")
+        path = Path(cleaned)
+        if path.is_absolute() or ".." in path.parts:
+            raise ManifestError(
+                f"skill path must be relative to the checkout and stay inside it: {item!r}"
+            )
+        result.append(path.as_posix())
+    return tuple(result)
+
+
 @dataclass(frozen=True)
 class Manifest:
     name: str
@@ -76,6 +105,7 @@ class Manifest:
     remove: tuple[str, ...] = ()
     commands: dict[str, str] = field(default_factory=dict)
     command: str | None = None
+    skills: tuple[str, ...] = ()
     schema: int = 1
     homepage: str | None = None
 
@@ -179,6 +209,7 @@ class Manifest:
             remove=tuple(lifecycle["remove"]),
             commands=commands,
             command=command.strip() if command else None,
+            skills=normalize_skills(data.get("skill")),
             homepage=data.get("homepage"),
         )
 
@@ -199,6 +230,8 @@ class Manifest:
         }
         if self.command:
             result["command"] = self.command
+        if self.skills:
+            result["skill"] = list(self.skills)
         if self.homepage:
             result["homepage"] = self.homepage
         return result

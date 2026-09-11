@@ -196,3 +196,38 @@ def test_own_ownbox_yaml_still_parses():
     manifest = Manifest.from_path(path, "BogdanStamenovic/ownbox")
     assert manifest.name == "ownbox-dev"
     assert manifest.platforms == ("linux", "darwin", "windows")
+
+
+def test_skill_parses_single_string_and_list():
+    single = Manifest.from_text("name: demo\ndescription: Demo\nskill: skills/demo\n")
+    assert single.skills == ("skills/demo",)
+    assert single.command is None  # a skill-only tool needs no command
+
+    many = Manifest.from_text(
+        "name: demo\ndescription: Demo\nskill:\n  - skills/a\n  - skills/b/SKILL.md\n"
+    )
+    assert many.skills == ("skills/a", "skills/b/SKILL.md")
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ("/abs/skill", "stay inside"),
+        ("../escape", "stay inside"),
+        ("a/../../b", "stay inside"),
+        ("[1, 2]", "path string"),
+        ('""', "non-empty"),
+    ],
+)
+def test_skill_rejects_unsafe_paths(value, message):
+    with pytest.raises(ManifestError, match=message):
+        Manifest.from_text(f"name: demo\ndescription: Demo\nskill: {value}\n")
+
+
+def test_skill_round_trips():
+    original = Manifest(
+        name="demo", description="Demo", repo="me/demo", skills=("skills/demo",)
+    )
+    restored = Manifest.from_dict(original.to_dict(), original.repo)
+    assert restored == original
+    assert restored.skills == ("skills/demo",)

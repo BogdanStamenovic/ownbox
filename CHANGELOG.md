@@ -6,6 +6,21 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-11
+
+### Added
+
+- `skill` manifest field installs one or more Claude Code skills into
+  `~/.claude/skills` when a tool is installed. Accepts a single checkout-relative
+  path or a list. On POSIX each skill is symlinked into the checkout, so
+  `ownbox update` refreshes its content automatically; where symlinks are
+  unavailable the directory is copied and stamped with a marker. Uninstall
+  removes the skills, refusing to touch any directory Ownbox did not install.
+- A tool may declare `skill` with no `command`: a skill-only repository installs
+  its instructions and creates no launcher.
+- `ownbox init --skill PATH` scaffolds a manifest that installs a skill, and
+  `OWNBOX_SKILLS_DIR` overrides the skills destination (default `~/.claude/skills`).
+
 ## [0.6.0] - 2026-08-19
 
 ### Added

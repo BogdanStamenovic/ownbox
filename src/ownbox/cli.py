@@ -25,6 +25,7 @@ from .store import (
     new_catalog,
     resolve_installation,
     rollback,
+    skill_dest_paths,
     uninstall,
     update,
 )
@@ -129,6 +130,8 @@ def print_manifest_details(tool: Manifest) -> None:
         print("Commands:")
         for launcher_name, command in tool.commands.items():
             print(f"  {launcher_name}: {command}")
+    if tool.skills:
+        print(f"Skills: {', '.join(tool.skills)}")
 
 
 def parse_yes_flag(arguments: list[str], usage: str) -> bool:
@@ -263,6 +266,13 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="COMMAND",
         help="native cleanup command; repeat as needed",
     )
+    init.add_argument(
+        "--skill",
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="checkout-relative path to a skill directory to install; repeat as needed",
+    )
 
     sub.add_parser("doctor", help="check local dependencies and GitHub login")
     return parser
@@ -329,9 +339,13 @@ def main(argv: list[str] | None = None) -> int:
                 return 2
             target = install(tool, args.path)
             print(f"Installed {tool.name} at {target}")
-            for name in tool.entry_commands() or {tool.name: ""}:
+            for name in tool.entry_commands():
                 print(f"Command: {launcher_path(name)}")
-            if str(bin_home()) not in os.environ.get("PATH", "").split(os.pathsep):
+            for name, dest in skill_dest_paths(tool).items():
+                print(f"Skill: {name} -> {dest}")
+            if tool.entry_commands() and str(bin_home()) not in os.environ.get("PATH", "").split(
+                os.pathsep
+            ):
                 print(f"Add {bin_home()} to PATH to invoke '{tool.name}' directly.")
         elif args.command in {"uninstall", "remove"}:
             target = uninstall(
@@ -385,10 +399,13 @@ def main(argv: list[str] | None = None) -> int:
             if path.exists():
                 raise RuntimeError("ownbox.yaml already exists")
             command = args.entry_command
-            if not command and sys.stdin.isatty():
+            if not command and not args.skill and sys.stdin.isatty():
                 command = input("Project entry command: ").strip()
-            if not command:
-                raise RuntimeError("an entry command is required; use --command 'your command'")
+            if not command and not args.skill:
+                raise RuntimeError(
+                    "an entry command or a skill is required; use --command 'your command' "
+                    "or --skill path/to/skill"
+                )
             data = {
                 "schema": 1,
                 "name": args.name,
@@ -400,8 +417,11 @@ def main(argv: list[str] | None = None) -> int:
                     "update": args.update,
                     "remove": args.remove,
                 },
-                "command": command,
             }
+            if command:
+                data["command"] = command
+            if args.skill:
+                data["skill"] = args.skill
             path.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
             print(f"Created {path}; edit it, commit it, then run 'ownbox sync'.")
         elif args.command == "doctor":

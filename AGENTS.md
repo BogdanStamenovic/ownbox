@@ -27,6 +27,11 @@ For a repository with multiple executables, use a top-level `commands` mapping
 instead of `command`. Each key becomes a launcher and each value is a command
 string or platform mapping; all launchers share the same checkout and lifecycle.
 
+To ship a Claude Code skill, add a top-level `skill` key naming the
+checkout-relative directory (or list of directories) that hold a `SKILL.md`.
+Ownbox links each into `~/.claude/skills` on install and removes it on uninstall.
+A repository may declare `skill` with no `command` to install a skill-only tool.
+
 No central registry is involved: GitHub repositories and their manifests are the registry.
 Use `ownbox sync --owner NAME` to select a different user or organization.
 

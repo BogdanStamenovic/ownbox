@@ -170,6 +170,44 @@ Commit the file to the repository's default branch and run `ownbox sync`. The re
 already searchable; its new setup and entry command will now be available. No change to a central
 registry is needed.
 
+## Installing a Claude Code skill
+
+A repository can carry one or more [Claude Code skills](https://docs.claude.com/en/docs/claude-code/skills)
+and have Ownbox install them into `~/.claude/skills` alongside (or instead of) a command. Point
+`skill` at the checkout-relative directory that holds a `SKILL.md`:
+
+```yaml
+schema: 1
+name: local-image
+description: Generate and edit images locally with FLUX on your own GPU.
+install:
+  platforms: [linux]
+  setup:
+    linux: [python install.py]     # set up the model server, weights, venv
+command: bin/imagegen              # the executable the skill drives
+skill: skills/local-image          # linked into ~/.claude/skills/local-image
+```
+
+`skill` accepts a single path or a list, so a "group" repository can install several skills at
+once:
+
+```yaml
+skill:
+  - skills/animate
+  - skills/review-animations
+```
+
+On install, Ownbox symlinks each skill directory into `~/.claude/skills/<dir-name>`, so
+`ownbox update` refreshes the skill's content for free. Where symlinks are unavailable (Windows
+without the privilege) the directory is copied and stamped with a marker instead. The directory
+name must match the skill's own `name:` frontmatter — that is what Claude Code loads it by.
+Uninstalling the tool removes its skills, and Ownbox refuses to touch a skill directory it did
+not install, so a hand-made skill of the same name is never clobbered.
+
+A tool may declare `skill` with no `command` at all — a skill-only repository installs its
+instructions and creates no launcher. Override the destination with `OWNBOX_SKILLS_DIR` (it
+defaults to `~/.claude/skills` on every platform).
+
 ### Manifest fields
 
 | Field | Required | Meaning |
@@ -183,8 +221,9 @@ registry is needed.
 | `install.setup` | no | Setup-command list, or mapping by platform |
 | `install.update` | no | Native update-command list, or mapping by platform |
 | `install.remove` | no | Native cleanup-command list, or mapping by platform |
-| `command` | one entry form required | Single entry command string, or mapping by platform |
-| `commands` | one entry form required | Launcher-name map whose values are commands or platform mappings |
+| `command` | one entry form required unless `skill` is set | Single entry command string, or mapping by platform |
+| `commands` | one entry form required unless `skill` is set | Launcher-name map whose values are commands or platform mappings |
+| `skill` | no | Checkout-relative path (or list of paths) to skill directories linked into `~/.claude/skills` |
 
 Lifecycle commands are code from the repository. Ownbox displays them and asks for confirmation
 before running them. Use `--yes` only for repositories you trust.
@@ -231,6 +270,7 @@ is present regardless.
 
 - Tools: `$XDG_DATA_HOME/ownbox/tools` (usually `~/.local/share/ownbox/tools`)
 - Launchers: `$OWNBOX_BIN_DIR` (usually `~/.local/bin`)
+- Skills: `$OWNBOX_SKILLS_DIR` (usually `~/.claude/skills`)
 - Catalog: `$XDG_CACHE_HOME/ownbox/catalog.json`
 - Config: `$XDG_CONFIG_HOME/ownbox/config.yaml`
 

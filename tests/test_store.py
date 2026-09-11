@@ -1,4 +1,5 @@
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -799,3 +800,119 @@ def test_rollback_refuses_dirty_working_tree_without_force(tmp_path, monkeypatch
     assert revision == "old"
     assert target == checkout
     assert not any(isinstance(c, list) and "status" in c for c in calls)
+
+
+def seed_skill_clone(target, skill_rel="skills/demo", skill_name="demo"):
+    """A fake subprocess.run that populates `target` with a skill dir on clone."""
+    base = fake_git_run(target)
+
+    def fake_run(command, **kwargs):
+        result = base(command, **kwargs)
+        if isinstance(command, list) and command[:2] == ["git", "clone"]:
+            skill_dir = target / skill_rel
+            skill_dir.mkdir(parents=True, exist_ok=True)
+            (skill_dir / "SKILL.md").write_text(
+                f"---\nname: {skill_name}\ndescription: A skill\n---\nbody\n"
+            )
+        return result
+
+    return fake_run
+
+
+def test_install_links_skill_and_creates_no_launcher(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("OWNBOX_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    target = tmp_path / "checkout"
+    monkeypatch.setattr("ownbox.store.subprocess.run", seed_skill_clone(target))
+
+    manifest = Manifest(
+        name="demo", description="Demo", repo="me/demo", skills=("skills/demo",)
+    )
+    install(manifest, target)
+
+    link = tmp_path / "skills" / "demo"
+    assert link.is_symlink()
+    assert (link / "SKILL.md").read_text().startswith("---")
+    assert link.resolve() == (target / "skills" / "demo").resolve()
+    # A skill-only tool gets no launcher.
+    assert not (tmp_path / "bin" / "demo").exists()
+    assert installations()["demo"]["skills"] == {"demo": str(link)}
+    assert installations()["demo"].get("launchers", {}) == {}
+
+
+def test_uninstall_removes_the_skill_link(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("OWNBOX_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    target = tmp_path / "checkout"
+    monkeypatch.setattr("ownbox.store.subprocess.run", seed_skill_clone(target))
+    manifest = Manifest(
+        name="demo", description="Demo", repo="me/demo", skills=("skills/demo",)
+    )
+    install(manifest, target)
+    assert (tmp_path / "skills" / "demo").is_symlink()
+
+    uninstall("demo")
+    assert not (tmp_path / "skills" / "demo").exists()
+    assert not (tmp_path / "skills" / "demo").is_symlink()
+    assert installations() == {}
+
+
+def test_install_refuses_to_clobber_a_hand_made_skill(tmp_path, monkeypatch):
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("OWNBOX_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    # A pre-existing, human-authored skill of the same name.
+    existing = tmp_path / "skills" / "demo"
+    existing.mkdir(parents=True)
+    (existing / "SKILL.md").write_text("mine, keep it\n")
+    target = tmp_path / "checkout"
+    monkeypatch.setattr("ownbox.store.subprocess.run", seed_skill_clone(target))
+    manifest = Manifest(
+        name="demo", description="Demo", repo="me/demo", skills=("skills/demo",)
+    )
+
+    with pytest.raises(RuntimeError, match="not installed by ownbox"):
+        install(manifest, target)
+    # The human's skill is untouched and nothing was cloned.
+    assert (existing / "SKILL.md").read_text() == "mine, keep it\n"
+    assert not target.exists()
+    assert installations() == {}
+
+
+def test_copied_skill_is_marked_and_removed(tmp_path, monkeypatch):
+    """When symlinks are unavailable the skill is copied and stamped, then cleaned up."""
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("OWNBOX_SKILLS_DIR", str(tmp_path / "skills"))
+    monkeypatch.setattr("ownbox.store.shutil.which", lambda name: None)
+    target = tmp_path / "checkout"
+    monkeypatch.setattr("ownbox.store.subprocess.run", seed_skill_clone(target))
+
+    real_symlink_to = Path.symlink_to
+
+    def no_symlinks(self, *a, **k):
+        raise OSError("symlinks unavailable")
+
+    monkeypatch.setattr(Path, "symlink_to", no_symlinks)
+    manifest = Manifest(
+        name="demo", description="Demo", repo="me/demo", skills=("skills/demo",)
+    )
+    install(manifest, target)
+
+    link = tmp_path / "skills" / "demo"
+    assert not link.is_symlink()
+    assert (link / ".ownbox-skill").is_file()
+    assert (link / "SKILL.md").exists()
+
+    monkeypatch.setattr(Path, "symlink_to", real_symlink_to)
+    uninstall("demo")
+    assert not link.exists()

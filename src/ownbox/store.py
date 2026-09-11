@@ -52,6 +52,18 @@ def bin_home() -> Path:
     return Path.home() / ".local/bin"
 
 
+def claude_skills_home() -> Path:
+    """Where Claude Code discovers agent skills: one directory per skill.
+
+    Overridable with OWNBOX_SKILLS_DIR, mirroring how OWNBOX_BIN_DIR overrides the
+    launcher directory. Same location on every platform because Claude Code reads
+    ~/.claude/skills regardless of OS.
+    """
+    if os.environ.get("OWNBOX_SKILLS_DIR"):
+        return Path(os.environ["OWNBOX_SKILLS_DIR"])
+    return Path.home() / ".claude" / "skills"
+
+
 @dataclass
 class Catalog:
     owner: str
@@ -153,11 +165,116 @@ def create_launcher(name: str) -> Path:
 
 def launcher_names(tool: Manifest) -> tuple[str, ...]:
     names = tuple(tool.entry_commands())
-    return names or (tool.name,)
+    if names:
+        return names
+    # A skill-only tool ships instructions, not an executable, so it gets no
+    # launcher; the tool.name fallback exists only for a runnable tool that
+    # somehow declared no explicit command.
+    if tool.skills:
+        return ()
+    return (tool.name,)
 
 
 def create_launchers(tool: Manifest) -> dict[str, str]:
     return {name: str(create_launcher(name)) for name in launcher_names(tool)}
+
+
+def skill_link_name(rel_path: str) -> str:
+    """The directory name a skill is installed under in the skills home.
+
+    A skill is a directory holding SKILL.md; if the manifest points straight at a
+    SKILL.md file the parent directory names it. Claude Code identifies a skill by
+    this directory name, so it must match the skill's own `name:` frontmatter.
+    """
+    path = Path(rel_path)
+    if path.name.casefold() == "skill.md":
+        path = path.parent
+    return path.name
+
+
+def skill_dest_paths(tool: Manifest) -> dict[str, Path]:
+    """Map each declared skill to where it will be installed, without touching disk."""
+    home = claude_skills_home()
+    return {skill_link_name(rel): home / skill_link_name(rel) for rel in tool.skills}
+
+
+def _skill_source(target: Path, rel_path: str) -> Path:
+    """Resolve a skill's source directory inside the checkout, refusing to escape it."""
+    path = Path(rel_path)
+    if path.name.casefold() == "skill.md":
+        path = path.parent
+    source = (target / path).resolve()
+    checkout = target.resolve()
+    if checkout != source and checkout not in source.parents:
+        raise RuntimeError(f"skill path escapes the checkout: {rel_path}")
+    if not source.is_dir():
+        raise RuntimeError(f"skill directory not found in checkout: {rel_path}")
+    if not (source / "SKILL.md").is_file():
+        raise RuntimeError(f"skill directory has no SKILL.md: {rel_path}")
+    return source
+
+
+def _owns_skill(dest: Path, target: Path) -> bool:
+    """True if `dest` is a skill Ownbox installed from `target` and is safe to remove."""
+    if dest.is_symlink():
+        try:
+            return target.resolve() in dest.resolve().parents or dest.resolve().parent == target.resolve()
+        except OSError:
+            return False
+    # A copied skill (Windows, or a symlink-less filesystem) carries a marker.
+    return (dest / ".ownbox-skill").is_file()
+
+
+def check_skill_dest(name: str, target: Path) -> Path:
+    dest = claude_skills_home() / name
+    if dest.exists() and not _owns_skill(dest, target):
+        raise RuntimeError(f"refusing to replace existing skill not installed by ownbox: {dest}")
+    return dest
+
+
+def install_skills(tool: Manifest, target: Path) -> dict[str, str]:
+    """Link (or copy) each declared skill into the Claude Code skills directory.
+
+    On POSIX a symlink into the checkout is created, so `ownbox update` refreshes
+    the skill content for free. Where symlinks are unavailable (Windows without the
+    privilege) the directory is copied and stamped with a marker so uninstall can
+    tell it apart from a hand-made skill of the same name.
+    """
+    installed: dict[str, str] = {}
+    home = claude_skills_home()
+    home.mkdir(parents=True, exist_ok=True)
+    for rel in tool.skills:
+        name = skill_link_name(rel)
+        source = _skill_source(target, rel)
+        dest = check_skill_dest(name, target)
+        if dest.exists() or dest.is_symlink():
+            if dest.is_symlink() or dest.is_file():
+                dest.unlink()
+            else:
+                shutil.rmtree(dest)
+        try:
+            dest.symlink_to(source, target_is_directory=True)
+        except (OSError, NotImplementedError):
+            shutil.copytree(source, dest)
+            (dest / ".ownbox-skill").write_text("installed by ownbox\n", encoding="utf-8")
+        installed[name] = str(dest)
+    return installed
+
+
+def remove_skills(skills: object, target: Path) -> None:
+    """Remove skills recorded for a tool, refusing to touch anything Ownbox didn't install."""
+    if not isinstance(skills, dict):
+        return
+    for name, recorded in skills.items():
+        dest = Path(recorded) if recorded else claude_skills_home() / name
+        if not dest.exists() and not dest.is_symlink():
+            continue
+        if not _owns_skill(dest, target):
+            raise RuntimeError(f"refusing to remove skill not installed by ownbox: {dest}")
+        if dest.is_symlink() or dest.is_file():
+            dest.unlink()
+        else:
+            shutil.rmtree(dest)
 
 
 def installed_launcher_paths(installed_name: str, item: dict) -> dict[str, Path]:
@@ -218,6 +335,10 @@ def install(
     target = (destination or data_home() / "tools" / tool.name).expanduser().resolve()
     if target.exists():
         raise RuntimeError(f"destination already exists: {target}")
+    # Refuse before cloning if a declared skill would clobber a hand-made one. The
+    # destination name is known from the manifest, so this needs no checkout.
+    for skill_name in skill_dest_paths(tool):
+        check_skill_dest(skill_name, target)
     if tool.setup and approve_commands is not None and not approve_commands(tool.setup):
         raise RuntimeError("setup commands were not approved")
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -250,6 +371,9 @@ def install(
 
     launchers = create_launchers(tool)
     state[tool.name]["launchers"] = launchers
+    skills = install_skills(tool, target)
+    if skills:
+        state[tool.name]["skills"] = skills
     state[tool.name]["state"] = "complete"
     save_installations(state)
     return target
@@ -294,6 +418,7 @@ def uninstall(
     for launcher in launchers.values():
         if launcher.exists():
             launcher.unlink()
+    remove_skills(item.get("skills"), target)
     if not keep_files and target.exists():
         shutil.rmtree(target)
 
@@ -365,6 +490,25 @@ def _refresh_launchers(
     item.pop("launcher", None)
 
 
+def _refresh_skills(item: dict, target: Path, manifest: Manifest | None) -> None:
+    """Re-link skills after landing on a new revision, retiring any no longer declared.
+
+    Symlinked skills already track the checkout's content across a fast-forward, so
+    the only thing that can change is the set of declared skills — a skill added,
+    removed, or renamed in the incoming manifest.
+    """
+    recorded = item.get("skills")
+    old_skills: dict[str, str] = recorded if isinstance(recorded, dict) else {}
+    new_names = set(skill_dest_paths(manifest).keys()) if manifest else set()
+    stale = {name: path for name, path in old_skills.items() if name not in new_names}
+    if stale:
+        remove_skills(stale, target)
+    if manifest and manifest.skills:
+        item["skills"] = install_skills(manifest, target)
+    else:
+        item.pop("skills", None)
+
+
 def record_history(item: dict, revision: str | None) -> None:
     """Prepend `revision` onto item["history"], trimmed to the configured keep-history length.
 
@@ -417,6 +561,7 @@ def update(
         _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
 
     _refresh_launchers(installed_name, item, state, manifest)
+    _refresh_skills(item, target, manifest)
     new_revision = git_revision(target)
     # An up-to-date update is a no-op; recording it would fill the rollback
     # history with duplicates of the current revision and burn every slot.
@@ -494,6 +639,7 @@ def rollback(
         _run(command, cwd=target, shell=True, check=True, timeout=COMMAND_TIMEOUT)
 
     _refresh_launchers(installed_name, item, state, manifest)
+    _refresh_skills(item, target, manifest)
     item["history"] = history[steps:]
     item["revision"] = target_revision
     item["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
