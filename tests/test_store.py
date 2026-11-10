@@ -916,3 +916,100 @@ def test_copied_skill_is_marked_and_removed(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, "symlink_to", real_symlink_to)
     uninstall("demo")
     assert not link.exists()
+
+
+def test_concurrent_updates_keep_each_others_entries(tmp_path, monkeypatch):
+    """Two updates overlap: both load the state, both run lifecycle commands, both save.
+    Each tool's new revision must survive (a whole-file save used to revert the other one)."""
+    import threading
+
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "config"))
+    checkouts = {}
+    for name in ("alpha", "beta"):
+        checkout = tmp_path / name
+        checkout.mkdir()
+        (checkout / "ownbox.yaml").write_text(
+            f"name: {name}\ndescription: D\ninstall:\n  update: [step-{name}]\n"
+        )
+        checkouts[name] = checkout
+    save_installations({
+        name: {"path": str(path), "repo": f"me/{name}", "revision": f"old-{name}"}
+        for name, path in checkouts.items()
+    })
+    both_mid_lifecycle = threading.Barrier(2, timeout=10)
+
+    def fake_run(command, **kwargs):
+        if isinstance(command, str):  # lifecycle command: wait until the other update is here too
+            both_mid_lifecycle.wait()
+            return completed(command)
+        if "show" in command:
+            raise subprocess.CalledProcessError(1, command)
+        if "rev-parse" in command:
+            name = Path(command[2]).name
+            return completed(command, stdout=f"new-{name}\n")
+        return completed(command)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    errors = []
+
+    def run(name):
+        try:
+            update(name)
+        except Exception as exc:  # noqa: BLE001 - surfaced below; would otherwise vanish
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(name,)) for name in checkouts]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=20)
+
+    assert errors == []
+    state = installations()
+    assert state["alpha"]["revision"] == "new-alpha"
+    assert state["beta"]["revision"] == "new-beta"
+    assert [h["revision"] for h in state["alpha"]["history"]] == ["old-alpha"]
+    assert [h["revision"] for h in state["beta"]["history"]] == ["old-beta"]
+
+
+def test_commit_installation_is_safe_across_processes(tmp_path):
+    """Several processes hammer the state file; no entry may be lost."""
+    import os
+    import sys
+
+    code = (
+        "import sys\n"
+        "from ownbox.store import commit_installation\n"
+        "for k in range(40):\n"
+        "    commit_installation(f'p{sys.argv[1]}-{k}', {'k': k})\n"
+    )
+    env = {**os.environ, "XDG_DATA_HOME": str(tmp_path / "data")}
+    procs = [subprocess.Popen([sys.executable, "-c", code, str(i)], env=env) for i in range(4)]
+    assert [p.wait(timeout=60) for p in procs] == [0, 0, 0, 0]
+    state = __import__("json").loads((tmp_path / "data/ownbox/installed.json").read_text())
+    assert len(state) == 160
+
+
+def test_uninstall_does_not_resurrect_or_drop_other_entries(tmp_path, monkeypatch):
+    """uninstall writes only its own deletion: an entry another process added after this one
+    loaded the state must survive."""
+    from ownbox.store import commit_installation
+
+    monkeypatch.setattr("ownbox.store.current_platform", lambda: "linux")
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("OWNBOX_BIN_DIR", str(tmp_path / "bin"))
+    checkout = tmp_path / "gone"
+    checkout.mkdir()
+    save_installations({"gone": {"path": str(checkout), "repo": "me/gone"}})
+    real_rmtree = __import__("shutil").rmtree
+
+    def rmtree_then_other_install(path, *args, **kwargs):
+        real_rmtree(path, *args, **kwargs)
+        commit_installation("newcomer", {"path": "/x", "repo": "me/newcomer"})
+
+    monkeypatch.setattr("ownbox.store.shutil.rmtree", rmtree_then_other_install)
+    uninstall("gone")
+    assert set(installations()) == {"newcomer"}

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import subprocess
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import IO
 
 from .manifest import Manifest, current_platform
 from .settings import _atomic_write, config_home, keep_history
@@ -128,6 +132,73 @@ def installations() -> dict[str, dict]:
 def save_installations(state: dict[str, dict]) -> None:
     path = data_home() / "installed.json"
     _atomic_write(path, json.dumps(state, indent=2) + "\n")
+
+
+@contextmanager
+def state_lock() -> Iterator[None]:
+    """Exclusive lock on installed.json, held only around a read-modify-write.
+
+    Several agents run ownbox on one machine. Without this, an install or update that loaded
+    the state before a long lifecycle run wrote the whole file back afterwards and silently
+    reverted every other tool's entry changed in between (lost update, seen 2026-11-10).
+    A sidecar file is locked because installed.json itself is replaced atomically, so a lock
+    on it would stay on the replaced inode. POSIX uses flock; Windows uses msvcrt.locking on
+    byte 0 of the sidecar.
+    """
+    path = data_home() / "installed.json.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+b") as handle:
+        _lock_file(handle)
+        try:
+            yield
+        finally:
+            _unlock_file(handle)
+
+
+def _lock_file(handle: IO[bytes]) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        while True:
+            try:
+                # LK_LOCK retries for about 10 s and then raises; keep waiting, as flock does.
+                msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno != errno.EDEADLOCK:  # anything but "still locked": fail loudly
+                    raise
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle: IO[bytes]) -> None:
+    if sys.platform == "win32":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+def commit_installation(name: str, entry: dict | None) -> None:
+    """Write one tool's entry (or delete it with None) into the current installed.json.
+
+    Re-reads the file under the lock so entries other processes changed since this one
+    loaded its copy survive; only `name` is replaced.
+    """
+    with state_lock():
+        state = installations()
+        if entry is None:
+            state.pop(name, None)
+        else:
+            state[name] = entry
+        save_installations(state)
 
 
 def launcher_path(name: str) -> Path:
@@ -358,7 +429,7 @@ def install(
         "revision": git_revision(target),
         "state": "incomplete",
     }
-    save_installations(state)
+    commit_installation(tool.name, state[tool.name])
 
     try:
         for command in tool.setup:
@@ -375,7 +446,7 @@ def install(
     if skills:
         state[tool.name]["skills"] = skills
     state[tool.name]["state"] = "complete"
-    save_installations(state)
+    commit_installation(tool.name, state[tool.name])
     return target
 
 
@@ -423,7 +494,7 @@ def uninstall(
         shutil.rmtree(target)
 
     del state[installed_name]
-    save_installations(state)
+    commit_installation(installed_name, None)
     return target
 
 
@@ -569,7 +640,7 @@ def update(
         record_history(item, old_revision)
     item["revision"] = new_revision
     item["updated_at"] = datetime.now(timezone.utc).isoformat()
-    save_installations(state)
+    commit_installation(installed_name, item)
     return target
 
 
@@ -643,5 +714,5 @@ def rollback(
     item["history"] = history[steps:]
     item["revision"] = target_revision
     item["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
-    save_installations(state)
+    commit_installation(installed_name, item)
     return target, target_revision
