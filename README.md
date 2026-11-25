@@ -234,9 +234,14 @@ before running them. Use `--yes` only for repositories you trust.
 and only fast-forwards the checkout once you approve them. Declining leaves the checkout
 exactly as it was.
 
+If the fetched commit is the one already installed, `update` does nothing: no merge, no
+update commands, so no rebuild and no service restart. It says "already up to date at
+<rev>" and exits 0. `ownbox update NAME --force` reruns the update commands anyway, and an
+installation left incomplete by a failed run is always rerun.
+
 `ownbox update-all` runs that over every installed tool. A tool that fails does not stop
-the rest; incomplete installations are skipped, and the command exits non-zero if anything
-failed.
+the rest; incomplete installations are skipped, unchanged tools are counted as unchanged
+and left alone, and the command exits non-zero if anything failed.
 
 Ownbox records the commit each tool is on, so `ownbox list` shows the short revision and
 `NAME info` shows the full one along with the revisions available to roll back to.

@@ -17,6 +17,7 @@ from .manifest import Manifest, ManifestError, current_platform
 from .settings import SETTINGS, all_settings, set_setting
 from .store import (
     Catalog,
+    UpToDate,
     bin_home,
     config_home,
     install,
@@ -209,6 +210,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     upgrade.add_argument("name")
     upgrade.add_argument("-y", "--yes", action="store_true", help="approve app update commands")
+    upgrade.add_argument(
+        "--force",
+        action="store_true",
+        help="rerun the update steps even when the commit has not changed",
+    )
 
     update_all = sub.add_parser("update-all", help="pull and update every installed tool")
     update_all.add_argument(
@@ -283,7 +289,7 @@ def run_update_all(assume_yes: bool) -> int:
     if not state:
         print("No tools installed yet.")
         return 0
-    updated = skipped = failed = 0
+    updated = skipped = failed = unchanged = 0
     for name in sorted(state):
         item = state[name]
         if item.get("state") == "incomplete":
@@ -295,13 +301,17 @@ def run_update_all(assume_yes: bool) -> int:
 
         try:
             target = update(name, approve_commands=approve)
+        except UpToDate as exc:
+            unchanged += 1
+            print(f"{name}: already up to date at {exc.revision[:7]}")
+            continue
         except (RuntimeError, OSError, subprocess.CalledProcessError) as exc:
             failed += 1
             print(f"{name}: failed ({error_message(exc)})")
             continue
         updated += 1
         print(f"{name}: updated at {target}")
-    print(f"update-all: {updated} updated, {skipped} skipped, {failed} failed")
+    print(f"update-all: {updated} updated, {unchanged} unchanged, {skipped} skipped, {failed} failed")
     return 1 if failed else 0
 
 
@@ -368,12 +378,17 @@ def main(argv: list[str] | None = None) -> int:
                 flag = "  (incomplete)" if item.get("state") == "incomplete" else ""
                 print(f"{name:<24} {revision:<8} {item['path']}{flag}")
         elif args.command in {"update", "upgrade"}:
-            target = update(
-                args.name,
-                approve_commands=lambda commands: confirm_commands(
-                    args.name, "update", commands, args.yes
-                ),
-            )
+            try:
+                target = update(
+                    args.name,
+                    approve_commands=lambda commands: confirm_commands(
+                        args.name, "update", commands, args.yes
+                    ),
+                    force=args.force,
+                )
+            except UpToDate as exc:
+                print(f"{exc} (nothing to do; --force reruns the update steps)")
+                return 0
             print(f"Updated {args.name} at {target}")
         elif args.command == "update-all":
             return run_update_all(args.yes)
@@ -493,12 +508,16 @@ def dispatch_tool(name: str, arguments: list[str]) -> int:
         action = arguments[0] if arguments else None
         if action == "update":
             assume_yes = parse_yes_flag(arguments[1:], "usage: <app> update [--yes]")
-            updated = update(
-                installed_name,
-                approve_commands=lambda commands: confirm_commands(
-                    installed_name, "update", commands, assume_yes
-                ),
-            )
+            try:
+                updated = update(
+                    installed_name,
+                    approve_commands=lambda commands: confirm_commands(
+                        installed_name, "update", commands, assume_yes
+                    ),
+                )
+            except UpToDate as exc:
+                print(f"{exc} (nothing to do)")
+                return 0
             print(f"Updated {installed_name} at {updated}")
             return 0
         if action in {"uninstall", "remove"}:

@@ -223,7 +223,7 @@ def test_update_all_happy_path(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "a: updated at /p/a" in out
     assert "b: updated at /p/b" in out
-    assert "update-all: 2 updated, 0 skipped, 0 failed" in out
+    assert "update-all: 2 updated, 0 unchanged, 0 skipped, 0 failed" in out
 
 
 def test_update_all_continues_past_failing_tool(monkeypatch, capsys):
@@ -243,7 +243,7 @@ def test_update_all_continues_past_failing_tool(monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "a: failed (boom)" in out
     assert "b: updated at /p/b" in out
-    assert "update-all: 1 updated, 0 skipped, 1 failed" in out
+    assert "update-all: 1 updated, 0 unchanged, 0 skipped, 1 failed" in out
 
 
 def test_update_all_skips_incomplete_installs(monkeypatch, capsys):
@@ -264,7 +264,7 @@ def test_update_all_skips_incomplete_installs(monkeypatch, capsys):
     assert calls == ["b"]
     out = capsys.readouterr().out
     assert "a: skipped (incomplete installation)" in out
-    assert "update-all: 1 updated, 1 skipped, 0 failed" in out
+    assert "update-all: 1 updated, 0 unchanged, 1 skipped, 0 failed" in out
 
 
 def test_update_all_nothing_installed(monkeypatch, capsys):
@@ -388,3 +388,34 @@ def test_settings_command_prints_key_value_and_help(monkeypatch, capsys):
     assert "keep-history" in out
     assert "5" in out
     assert "Number of prior revisions kept." in out
+
+
+def test_update_all_counts_unchanged_tools(monkeypatch, capsys):
+    from ownbox.store import UpToDate
+
+    monkeypatch.setattr(
+        "ownbox.cli.installations",
+        lambda: {"a": {"path": "/p/a", "state": "complete"}, "b": {"path": "/p/b", "state": "complete"}},
+    )
+
+    def fake_update(name, approve_commands=None):
+        if name == "a":
+            raise UpToDate("a", Path("/p/a"), "abcdef1234")
+        return Path(f"/p/{name}")
+
+    monkeypatch.setattr("ownbox.cli.update", fake_update)
+    assert main(["update-all", "--yes"]) == 0
+    out = capsys.readouterr().out
+    assert "a: already up to date at abcdef1" in out
+    assert "update-all: 1 updated, 1 unchanged, 0 skipped, 0 failed" in out
+
+
+def test_update_reports_up_to_date_and_exits_zero(monkeypatch, capsys):
+    from ownbox.store import UpToDate
+
+    def fake_update(name, approve_commands=None, force=False):
+        raise UpToDate(name, Path("/p/demo"), "abcdef1234")
+
+    monkeypatch.setattr("ownbox.cli.update", fake_update)
+    assert main(["update", "demo", "--yes"]) == 0
+    assert "already up to date at abcdef1" in capsys.readouterr().out

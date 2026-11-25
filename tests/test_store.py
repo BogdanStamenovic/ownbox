@@ -8,6 +8,7 @@ from ownbox.settings import set_setting
 from ownbox.store import (
     COMMAND_TIMEOUT,
     Catalog,
+    UpToDate,
     create_launcher,
     install,
     installations,
@@ -27,13 +28,19 @@ def completed(command, stdout=""):
     return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
 
 
-def fake_git_run(target, *, show_fails=True, revision="abc123"):
-    """A subprocess.run stand-in that fakes clone/rev-parse/show for a checkout at `target`."""
+def fake_git_run(target, *, show_fails=True, revision="abc123", fetched=None):
+    """A subprocess.run stand-in that fakes clone/rev-parse/show for a checkout at `target`.
+
+    rev-parse FETCH_HEAD answers `fetched` (default: a commit different from HEAD, so
+    update() sees something new); pass fetched=revision to model an unchanged remote.
+    """
 
     def fake_run(command, **kwargs):
         if isinstance(command, list) and command[:2] == ["git", "clone"]:
             target.mkdir(parents=True, exist_ok=True)
             return completed(command)
+        if isinstance(command, list) and "rev-parse" in command and "FETCH_HEAD" in command:
+            return completed(command, stdout=f"{fetched or 'fetched-' + revision}\n")
         if isinstance(command, list) and "rev-parse" in command:
             return completed(command, stdout=f"{revision}\n")
         if isinstance(command, list) and "show" in command and show_fails:
@@ -297,9 +304,11 @@ def test_update_prefers_native_update_commands_and_falls_back_to_setup(tmp_path,
     update("demo", approve_commands=lambda commands: commands == ("python update.py",))
 
     assert calls[0][0] == ["git", "-C", str(checkout), "fetch"]
-    assert calls[1][0] == ["git", "-C", str(checkout), "show", "FETCH_HEAD:ownbox.yaml"]
-    assert calls[2][0] == ["git", "-C", str(checkout), "merge", "--ff-only", "FETCH_HEAD"]
-    assert calls[3] == (
+    assert calls[1][0] == ["git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"]
+    assert calls[2][0] == ["git", "-C", str(checkout), "rev-parse", "HEAD"]
+    assert calls[3][0] == ["git", "-C", str(checkout), "show", "FETCH_HEAD:ownbox.yaml"]
+    assert calls[4][0] == ["git", "-C", str(checkout), "merge", "--ff-only", "FETCH_HEAD"]
+    assert calls[5] == (
         "python update.py",
         {"cwd": checkout, "shell": True, "check": True, "timeout": COMMAND_TIMEOUT},
     )
@@ -311,7 +320,7 @@ def test_update_prefers_native_update_commands_and_falls_back_to_setup(tmp_path,
 
     update("demo", approve_commands=lambda commands: commands == ("python setup.py",))
 
-    assert calls[3] == (
+    assert calls[5] == (
         "python setup.py",
         {"cwd": checkout, "shell": True, "check": True, "timeout": COMMAND_TIMEOUT},
     )
@@ -345,6 +354,8 @@ def test_update_declining_leaves_checkout_completely_untouched(tmp_path, monkeyp
     # bump was ever recorded, so the checkout is exactly as it was before update() ran.
     assert calls == [
         ["git", "-C", str(checkout), "fetch"],
+        ["git", "-C", str(checkout), "rev-parse", "FETCH_HEAD"],
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
         ["git", "-C", str(checkout), "show", "FETCH_HEAD:ownbox.yaml"],
     ]
     assert "revision" not in installations()["demo"]
@@ -571,11 +582,14 @@ def test_update_does_not_record_history_when_already_up_to_date(tmp_path, monkey
         {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "same-sha"}}
     )
     monkeypatch.setattr(
-        "ownbox.store.subprocess.run", fake_git_run(checkout, revision="same-sha")
+        "ownbox.store.subprocess.run",
+        fake_git_run(checkout, revision="same-sha", fetched="same-sha"),
     )
 
-    update("demo")
-    update("demo")
+    with pytest.raises(UpToDate):
+        update("demo")
+    with pytest.raises(UpToDate):
+        update("demo")
 
     state = installations()
     assert state["demo"]["revision"] == "same-sha"
@@ -949,7 +963,8 @@ def test_concurrent_updates_keep_each_others_entries(tmp_path, monkeypatch):
             raise subprocess.CalledProcessError(1, command)
         if "rev-parse" in command:
             name = Path(command[2]).name
-            return completed(command, stdout=f"new-{name}\n")
+            prefix = "fetched" if "FETCH_HEAD" in command else "new"
+            return completed(command, stdout=f"{prefix}-{name}\n")
         return completed(command)
 
     monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
@@ -1013,3 +1028,74 @@ def test_uninstall_does_not_resurrect_or_drop_other_entries(tmp_path, monkeypatc
     monkeypatch.setattr("ownbox.store.shutil.rmtree", rmtree_then_other_install)
     uninstall("gone")
     assert set(installations()) == {"newcomer"}
+
+
+def test_update_with_unchanged_commit_runs_nothing(tmp_path, monkeypatch):
+    """Bogdan, 2026-11-25: an update whose commit hasn't changed does nothing:
+    no merge, no lifecycle command (no rebuild, no service restart)."""
+    configure_platforms(monkeypatch, tmp_path)
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    (checkout / "ownbox.yaml").write_text(
+        "name: demo\ndescription: Demo\ninstall:\n  update: [python update.py]\n"
+    )
+    save_installations(
+        {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "same-sha",
+                  "state": "complete"}}
+    )
+    calls = []
+    inner = fake_git_run(checkout, revision="same-sha", fetched="same-sha")
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        return inner(command, **kwargs)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    approved = []
+    with pytest.raises(UpToDate) as info:
+        update("demo", approve_commands=lambda commands: approved.append(commands) or True)
+    assert info.value.revision == "same-sha"
+    assert approved == []
+    assert not any(isinstance(c, str) for c in calls)  # no lifecycle command
+    assert not any(isinstance(c, list) and "merge" in c for c in calls)
+    assert "updated_at" not in installations()["demo"]
+
+
+def test_update_force_reruns_lifecycle_on_unchanged_commit(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    save_installations(
+        {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "same-sha"}}
+    )
+    calls = []
+    inner = fake_git_run(checkout, revision="same-sha", fetched="same-sha", show_fails=False)
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if isinstance(command, list) and "show" in command:
+            return completed(
+                command,
+                stdout="name: demo\ndescription: Demo\ninstall:\n  update: [python update.py]\n",
+            )
+        return inner(command, **kwargs)
+
+    monkeypatch.setattr("ownbox.store.subprocess.run", fake_run)
+    update("demo", force=True)
+    assert "python update.py" in calls
+
+
+def test_update_reruns_an_incomplete_install_even_on_unchanged_commit(tmp_path, monkeypatch):
+    configure_platforms(monkeypatch, tmp_path)
+    checkout = tmp_path / "demo"
+    checkout.mkdir()
+    save_installations(
+        {"demo": {"path": str(checkout), "repo": "me/demo", "revision": "same-sha",
+                  "state": "incomplete"}}
+    )
+    monkeypatch.setattr(
+        "ownbox.store.subprocess.run",
+        fake_git_run(checkout, revision="same-sha", fetched="same-sha"),
+    )
+    update("demo")  # no UpToDate: the last lifecycle run never completed
+    assert installations()["demo"]["revision"] == "same-sha"

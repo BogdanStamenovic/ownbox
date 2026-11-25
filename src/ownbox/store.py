@@ -597,9 +597,38 @@ def record_history(item: dict, revision: str | None) -> None:
     item["history"] = [entry, *history][:keep]
 
 
+class UpToDate(Exception):
+    """Raised by update() when the fetched commit is the one already installed.
+
+    Nothing is merged and no lifecycle command runs: an unchanged commit must not
+    rebuild dependencies or restart services (Bogdan, 2026-11-25).
+    """
+
+    def __init__(self, name: str, path: Path, revision: str) -> None:
+        super().__init__(f"{name} is already up to date at {revision[:7]}")
+        self.name = name
+        self.path = path
+        self.revision = revision
+
+
+def _rev_parse(target: Path, ref: str) -> str | None:
+    try:
+        result = _run(
+            ["git", "-C", str(target), "rev-parse", ref],
+            timeout=CLONE_TIMEOUT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (subprocess.CalledProcessError, OSError):
+        return None
+    return result.stdout.strip() or None
+
+
 def update(
     name: str,
     approve_commands: Callable[[tuple[str, ...]], bool] | None = None,
+    force: bool = False,
 ) -> Path:
     state = installations()
     installed_name, item = resolve_installation(state, name)
@@ -610,6 +639,14 @@ def update(
         _run(["git", "-C", str(target), "fetch"], timeout=CLONE_TIMEOUT, check=True)
     except subprocess.CalledProcessError as exc:
         raise RuntimeError(f"failed to fetch updates for {installed_name}") from exc
+
+    # Skip only when the answer is certain: both revisions known and equal, and the
+    # last lifecycle run completed. An incomplete install, or --force, reruns it.
+    if not force and item.get("state") != "incomplete":
+        fetched = _rev_parse(target, "FETCH_HEAD")
+        current = _rev_parse(target, "HEAD")
+        if fetched and current and fetched == current:
+            raise UpToDate(installed_name, target, current)
 
     manifest = _read_incoming_manifest(target, item["repo"])
     commands: tuple[str, ...] = ()
